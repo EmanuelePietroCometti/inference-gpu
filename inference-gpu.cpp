@@ -20,14 +20,12 @@
 namespace fs = std::filesystem;
 
 struct PerformanceMetrics {
-    std::vector<double> loading_times;
     std::vector<double> preprocessing_times;
     std::vector<double> batch_prep_times;
 
     std::vector<double> gpu_times;
 
     std::vector<double> postprocessing_times;
-    std::vector<double> downloading_times;
 };
 
 struct BatchData {
@@ -119,33 +117,49 @@ void preprocessingThread(
     BoundedThreadSafeQueue<std::shared_ptr<BatchData>>& queue_out,
     PerformanceMetrics& metrics
 ) {
-    auto current_batch = std::make_shared<BatchData>();
-    current_batch->original_images.reserve(BATCH_SIZE);
-    current_batch->filenames.reserve(BATCH_SIZE);
-
-    std::vector<cv::Mat> temp_preprocessed_images;
-    temp_preprocessed_images.reserve(BATCH_SIZE);
+    std::vector<std::string> batch_filepaths;
+    std::vector<std::string> batch_filenames;
+    batch_filepaths.reserve(BATCH_SIZE);
+    batch_filenames.reserve(BATCH_SIZE);
 
     for (const auto& entry : fs::directory_iterator(input_dir)) {
         if (!g_is_running) break;
 
         if (entry.is_regular_file()) {
-            auto start_loading = std::chrono::high_resolution_clock::now();
-            cv::Mat image = cv::imread(entry.path().string(), cv::IMREAD_COLOR_RGB);
-            auto end_loading = std::chrono::high_resolution_clock::now();
-            metrics.loading_times.push_back(std::chrono::duration<double, std::milli>(end_loading - start_loading).count());
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".bmp" && ext != ".BMP") continue;
 
-            if (image.empty()) continue;
+            batch_filepaths.push_back(entry.path().string());
+            batch_filenames.push_back(entry.path().filename().string());
 
-            current_batch->original_images.push_back(image.clone());
-            auto start_preprocessing = std::chrono::high_resolution_clock::now();
-            temp_preprocessed_images.push_back(preprocessImage(image));
-            auto end_preprocessing = std::chrono::high_resolution_clock::now();
-            metrics.preprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_preprocessing - start_preprocessing).count());
-            current_batch->filenames.push_back(entry.path().filename().string());
+            if (batch_filepaths.size() == BATCH_SIZE) {
+                auto current_batch = std::make_shared<BatchData>();
 
-            if (temp_preprocessed_images.size() == BATCH_SIZE) {
+                current_batch->original_images.resize(BATCH_SIZE);
+                std::vector<cv::Mat> temp_preprocessed_images(BATCH_SIZE);
+
+                current_batch->filenames = batch_filenames;
                 current_batch->valid_images = BATCH_SIZE;
+
+                auto start_prep = std::chrono::high_resolution_clock::now();
+
+                cv::parallel_for_(cv::Range(0, BATCH_SIZE), [&](const cv::Range& range) {
+                    for (int i = range.start; i < range.end; i++) {
+                        cv::Mat image = cv::imread(batch_filepaths[i], cv::IMREAD_COLOR_RGB);
+
+                        if (image.empty()) {
+                            fmt::print(stderr, "Warning: Corrupted image replaced with dummy: {}\n", batch_filepaths[i]);
+                            image = cv::Mat::zeros(cv::Size(RESIZE_WIDTH, RESIZE_HEIGHT), CV_8UC3);
+                        }
+
+                        current_batch->original_images[i] = image.clone();
+                        temp_preprocessed_images[i] = preprocessImage(image);
+                    }
+                    });
+
+                auto end_prep = std::chrono::high_resolution_clock::now();
+                metrics.preprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_prep - start_prep).count());
 
                 auto start_batch = std::chrono::high_resolution_clock::now();
                 current_batch->blob = cv::dnn::blobFromImages(
@@ -157,18 +171,36 @@ void preprocessingThread(
                 }
                 auto end_batch = std::chrono::high_resolution_clock::now();
                 metrics.batch_prep_times.push_back(std::chrono::duration<double, std::milli>(end_batch - start_batch).count());
+
                 if (!queue_out.push(current_batch)) break;
 
-                current_batch = std::make_shared<BatchData>();
-                current_batch->original_images.reserve(BATCH_SIZE);
-                current_batch->filenames.reserve(BATCH_SIZE);
-                temp_preprocessed_images.clear();
+                batch_filepaths.clear();
+                batch_filenames.clear();
             }
         }
     }
 
-    if (!temp_preprocessed_images.empty()) {
-        current_batch->valid_images = temp_preprocessed_images.size();
+    if (!batch_filepaths.empty()) {
+        int remaining_size = batch_filepaths.size();
+        auto current_batch = std::make_shared<BatchData>();
+
+        current_batch->original_images.resize(remaining_size);
+        current_batch->filenames = batch_filenames;
+        current_batch->valid_images = remaining_size;
+
+        std::vector<cv::Mat> temp_preprocessed_images(remaining_size);
+
+        auto start_prep = std::chrono::high_resolution_clock::now();
+        cv::parallel_for_(cv::Range(0, remaining_size), [&](const cv::Range& range) {
+            for (int i = range.start; i < range.end; i++) {
+                cv::Mat image = cv::imread(batch_filepaths[i], cv::IMREAD_COLOR_RGB);
+                if (image.empty()) image = cv::Mat::zeros(cv::Size(RESIZE_WIDTH, RESIZE_HEIGHT), CV_8UC3);
+                current_batch->original_images[i] = image.clone();
+                temp_preprocessed_images[i] = preprocessImage(image);
+            }
+            });
+        auto end_prep = std::chrono::high_resolution_clock::now();
+        metrics.preprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_prep - start_prep).count());
 
         while (temp_preprocessed_images.size() < BATCH_SIZE) {
             temp_preprocessed_images.push_back(temp_preprocessed_images.back().clone());
@@ -275,92 +307,85 @@ void postprocessingThread(
     BoundedThreadSafeQueue<std::shared_ptr<InferenceResult>>& queue_in,
     PerformanceMetrics& metrics
 ) {
-
     while (g_is_running) {
         std::shared_ptr<InferenceResult> result;
-
         if (!queue_in.pop(result)) break;
 
         int valid_image_count = result->batch_info->valid_images;
-        int map_area = result->map_h * result->map_w;
 
-        for (int j = 0; j < valid_image_count; j++) {
-            auto start_post = std::chrono::high_resolution_clock::now();
-            // Extract original image
-            cv::Mat original_rgb = result->batch_info->original_images[j];
-            cv::Mat original_bgr;
-            cv::cvtColor(original_rgb, original_bgr, cv::COLOR_RGB2BGR);
+        auto start_post = std::chrono::high_resolution_clock::now();
 
-            float score = result->pred_scores[j];
-            std::string filename = result->batch_info->filenames[j];
+        cv::parallel_for_(cv::Range(0, valid_image_count), [&](const cv::Range& range) {
+            for (int j = range.start; j < range.end; j++) {
 
-            // Heatmap overlay
-            int map_area = result->map_h * result->map_w;
+                cv::Mat original_rgb = result->batch_info->original_images[j];
+                cv::Mat original_bgr;
+                cv::cvtColor(original_rgb, original_bgr, cv::COLOR_RGB2BGR);
 
-            size_t elements_per_item = result->anomaly_maps.size() / valid_image_count;
-            int offset_map = j * elements_per_item;
+                float score = result->pred_scores[j];
+                std::string filename = result->batch_info->filenames[j];
 
-            cv::Mat map_anomaly(result->map_h, result->map_w, CV_32F, result->anomaly_maps.data() + offset_map);
+                size_t elements_per_item = result->anomaly_maps.size() / BATCH_SIZE;
+                int offset_map = j * elements_per_item;
 
-            if (map_anomaly.empty() || map_anomaly.dims != 2) {
-                fmt::print(stderr, "Error: Reconstructed anomaly map is invalid for image {}\n", filename);
-                continue;
-            }
+                cv::Mat map_anomaly(result->map_h, result->map_w, CV_32F, result->anomaly_maps.data() + offset_map);
 
-            cv::Mat heatmap_norm, heatmap_colored, overlay_img;
-            cv::normalize(map_anomaly, heatmap_norm, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-            cv::applyColorMap(heatmap_norm, heatmap_colored, cv::COLORMAP_JET);
-
-            if (heatmap_colored.size() != original_bgr.size()) {
-                cv::resize(heatmap_colored, heatmap_colored, original_bgr.size(), 0, 0, cv::INTER_CUBIC);
-            }
-            cv::addWeighted(original_bgr, 0.5, heatmap_colored, 0.5, 0, overlay_img);
-
-            // Defect highlight
-            cv::Mat segmentation_img = original_bgr.clone();
-            std::vector<std::vector<cv::Point>> contours;
-
-            if (result->has_masks) {
-                int offset_mask = j * (result->mask_h * result->mask_w);
-                cv::Mat mask_uint8(result->mask_h, result->mask_w, CV_8U, result->pred_masks.data() + offset_mask);
-
-                if (mask_uint8.size() != original_bgr.size()) {
-                    cv::resize(mask_uint8, mask_uint8, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
+                if (map_anomaly.empty() || map_anomaly.dims != 2 || map_anomaly.size().area() == 0) {
+                    fmt::print(stderr, "Error: Invalid anomaly map generated for image {}\n", filename);
+                    continue;
                 }
-                cv::findContours(mask_uint8, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-            }
-            else {
-                cv::Mat mask_from_map;
-                cv::threshold(heatmap_norm, mask_from_map, 128, 255, cv::THRESH_BINARY);
-                if (mask_from_map.size() != original_bgr.size()) {
-                    cv::resize(mask_from_map, mask_from_map, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
+
+                cv::Mat heatmap_norm, heatmap_colored, overlay_img;
+                cv::normalize(map_anomaly, heatmap_norm, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+                cv::applyColorMap(heatmap_norm, heatmap_colored, cv::COLORMAP_JET);
+
+                if (heatmap_colored.size() != original_bgr.size()) {
+                    cv::resize(heatmap_colored, heatmap_colored, original_bgr.size(), 0, 0, cv::INTER_CUBIC);
                 }
-                cv::findContours(mask_from_map, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                cv::addWeighted(original_bgr, 0.5, heatmap_colored, 0.5, 0, overlay_img);
+
+                cv::Mat segmentation_img = original_bgr.clone();
+                std::vector<std::vector<cv::Point>> contours;
+
+                if (result->has_masks) {
+                    size_t mask_elements_per_item = result->pred_masks.size() / BATCH_SIZE;
+                    int offset_mask = j * mask_elements_per_item;
+                    cv::Mat mask_uint8(result->mask_h, result->mask_w, CV_8U, result->pred_masks.data() + offset_mask);
+
+                    if (mask_uint8.size() != original_bgr.size()) {
+                        cv::resize(mask_uint8, mask_uint8, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
+                    }
+                    cv::findContours(mask_uint8, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                }
+                else {
+                    cv::Mat mask_from_map;
+                    cv::threshold(heatmap_norm, mask_from_map, 128, 255, cv::THRESH_BINARY);
+                    if (mask_from_map.size() != original_bgr.size()) {
+                        cv::resize(mask_from_map, mask_from_map, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
+                    }
+                    cv::findContours(mask_from_map, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                }
+
+                cv::drawContours(segmentation_img, contours, -1, cv::Scalar(0, 0, 255), 2);
+
+                std::string score_text = fmt::format("Anomaly score: {:.4f}", score);
+                cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+                cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+
+                cv::Mat combined_result;
+                std::vector<cv::Mat> images_to_concat = { original_bgr, overlay_img, segmentation_img };
+                cv::hconcat(images_to_concat, combined_result);
+
+                ;
+                std::string save_name = fmt::format("{}", filename);
+                std::string out_path = (fs::path(output_dir) / save_name).string();
+
+                cv::imwrite(out_path, combined_result);
             }
+        });
 
-            cv::drawContours(segmentation_img, contours, -1, cv::Scalar(0, 0, 255), 2);
-            cv::drawContours(overlay_img, contours, -1, cv::Scalar(0, 0, 255), 2);
-
-            // Add score text overlay
-            std::string score_text = fmt::format("Score: {:.4f}", score);
-            cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-            cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-
-            // Triple Concatenation
-            cv::Mat combined_result;
-            std::vector<cv::Mat> images_to_concat = { original_bgr, overlay_img, segmentation_img };
-            cv::hconcat(images_to_concat, combined_result);
-            auto end_post = std::chrono::high_resolution_clock::now();
-            metrics.postprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_post - start_post).count());
-
-
-            auto start_down = std::chrono::high_resolution_clock::now();
-            std::string save_name = fmt::format("{:.3f}_{}", score, filename);
-            std::string out_path = (fs::path(output_dir) / save_name).string();
-            cv::imwrite(out_path, combined_result);
-            auto end_down = std::chrono::high_resolution_clock::now();
-            metrics.downloading_times.push_back(std::chrono::duration<double, std::milli>(end_down - start_down).count());
-        }
+        auto end_post = std::chrono::high_resolution_clock::now();
+        metrics.postprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_post - start_post).count());
     }
 }
 
@@ -525,41 +550,35 @@ int main(int argc, char* argv[]) {
             return std::accumulate(times.begin(), times.end(), 0.0) / times.size();
         };
 
-
-
-        double avg_loading = calc_avg(metrics.loading_times);
-        double avg_preprocessing = calc_avg(metrics.preprocessing_times);
-        double avg_batch_prep = calc_avg(metrics.batch_prep_times) / BATCH_SIZE;
+        double avg_preprocessing_per_image = calc_avg(metrics.preprocessing_times) / BATCH_SIZE;
+        double avg_batch_prep_per_image = calc_avg(metrics.batch_prep_times) / BATCH_SIZE;
         double avg_gpu_batch = calc_avg(metrics.gpu_times);
         double avg_gpu_per_image = avg_gpu_batch / BATCH_SIZE;
-        double avg_postprocessing = calc_avg(metrics.postprocessing_times);
-        double avg_downloading = calc_avg(metrics.downloading_times);
+        double avg_postprocessing_per_image = calc_avg(metrics.postprocessing_times) / BATCH_SIZE;
 
-        int total_images = metrics.loading_times.size();
+        int total_images = metrics.preprocessing_times.size() * BATCH_SIZE;
 
         fmt::print("\n========================================\n");
         fmt::print("        DETAILED PERFORMANCE REPORT      \n");
         fmt::print("========================================\n");
-        fmt::print("Batch Size used: {}\n", BATCH_SIZE);
-        fmt::print("Total Images processed: {}\n", total_images);
+        fmt::print("Batch size used: {}\n", BATCH_SIZE);
+        fmt::print("Estimated total images processed: {}\n", total_images);
         fmt::print("----------------------------------------\n");
-        fmt::print("Average Times per SINGLE Image (in Thread):\n");
-        fmt::print("  - Loading (Disk -> RAM)  : {:.3f} ms\n", avg_loading);
-        fmt::print("  - Preprocessing (CPU)    : {:.3f} ms\n", avg_preprocessing);
-        fmt::print("  - Batch Prep (CPU Memory): {:.3f} ms\n", avg_batch_prep);
-        fmt::print("  - GPU Inference          : {:.3f} ms  (Total Batch: {:.3f} ms)\n", avg_gpu_per_image, avg_gpu_batch);
-        fmt::print("  - Postprocessing (CPU)   : {:.3f} ms\n", avg_postprocessing);
-        fmt::print("  - Downloading (RAM->Disk): {:.3f} ms\n", avg_downloading);
+        fmt::print("Amortized average times per SINGLE image:\n");
+        fmt::print("  - Read & preprocess (CPU): {:.3f} ms\n", avg_preprocessing_per_image);
+        fmt::print("  - Batch prep (CPU memory): {:.3f} ms\n", avg_batch_prep_per_image);
+        fmt::print("  - GPU inference          : {:.3f} ms  (Total Batch: {:.3f} ms)\n", avg_gpu_per_image, avg_gpu_batch);
+        fmt::print("  - Postprocess & write    : {:.3f} ms\n", avg_postprocessing_per_image);
         fmt::print("----------------------------------------\n");
 
-        double t1_cost = avg_loading + avg_preprocessing + avg_batch_prep;
+        double t1_cost = avg_preprocessing_per_image + avg_batch_prep_per_image;
         double t2_cost = avg_gpu_per_image;
-        double t3_cost = avg_postprocessing + avg_downloading;
+        double t3_cost = avg_postprocessing_per_image;
         double bottleneck = std::max({ t1_cost, t2_cost, t3_cost });
 
-        fmt::print("Total Real-World Pipeline Time: {:.2f} ms\n", total_time_ms);
-        fmt::print("Theoretical Max Throughput    : {:.2f} FPS (Limited by slowest thread: {:.3f} ms/img)\n", 1000.0 / bottleneck, bottleneck);
-        fmt::print("Actual Measured Throughput    : {:.2f} FPS\n", (total_images * 1000.0) / total_time_ms);
+        fmt::print("Total real-world pipeline time: {:.2f} ms\n", total_time_ms);
+        fmt::print("Theoretical max throughput    : {:.2f} FPS (Limited by slowest thread: {:.3f} ms/img)\n", 1000.0 / bottleneck, bottleneck);
+        fmt::print("Actual measured throughput    : {:.2f} FPS\n", (total_images * 1000.0) / total_time_ms);
         fmt::print("========================================\n");
 
     }
