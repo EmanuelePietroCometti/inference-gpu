@@ -9,36 +9,367 @@
 #include <filesystem>
 #include <algorithm>
 #include <numeric>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <memory>
+#include <atomic>
+
 
 namespace fs = std::filesystem;
 
-cv::Mat preprocessImage(const cv::Mat& src_image, int resize_width, int resize_height, int crop_width, int crop_height) {
-    cv::Mat resized_image;
-    cv::resize(src_image, resized_image, cv::Size(resize_width, resize_height), 0, 0, cv::INTER_LINEAR);
+struct PerformanceMetrics {
+    std::vector<double> loading_times;
+    std::vector<double> preprocessing_times;
+    std::vector<double> batch_prep_times;
 
-    // Center crop of the image
-    int top = (resize_height - crop_height) / 2;
-    int left = (resize_width - crop_width) / 2;
-    cv::Rect roi(left, top, crop_width, crop_height);
+    std::vector<double> gpu_times;
+
+    std::vector<double> postprocessing_times;
+    std::vector<double> downloading_times;
+};
+
+struct BatchData {
+    cv::Mat blob;
+    std::vector<cv::Mat> original_images;
+    std::vector<std::string> filenames;
+    int valid_images;
+};
+
+struct InferenceResult {
+    std::shared_ptr<BatchData> batch_info;
+    std::vector<float> pred_scores;
+    std::vector<float> anomaly_maps;
+    int map_h;
+    int map_w;
+    std::vector<uint8_t> pred_masks;
+    int mask_h;
+    int mask_w;
+    bool has_masks = false;
+};
+
+template<typename T>
+class BoundedThreadSafeQueue {
+private:
+    std::queue<T> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_push_;
+    std::condition_variable cv_pop_;
+    size_t max_size_;
+    bool stopped_ = false;
+
+public:
+    explicit BoundedThreadSafeQueue(size_t max_size) : max_size_(max_size) {}
+
+    bool push(T item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_push_.wait(lock, [this]() { return queue_.size() < max_size_ || stopped_; });
+        if (stopped_) return false;
+        queue_.push(std::move(item));
+        cv_pop_.notify_one();
+        return true;
+    }
+
+    bool pop(T& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_pop_.wait(lock, [this]() { return !queue_.empty() || stopped_; });
+        if (stopped_ && queue_.empty()) return false;
+        item = std::move(queue_.front());
+        queue_.pop();
+        cv_push_.notify_one();
+        return true;
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopped_ = true;
+        cv_push_.notify_all();
+        cv_pop_.notify_all();
+    }
+};
+
+// PIPELINE CONFIGURATION
+const int BATCH_SIZE = 17;
+const int RESIZE_WIDTH = 256;
+const int RESIZE_HEIGHT = 256;
+const int CROP_WIDTH = 256;
+const int CROP_HEIGHT = 256;
+
+std::atomic<bool> g_is_running{ true };
+
+cv::Mat preprocessImage(const cv::Mat& src_image) {
+    cv::Mat resized_image;
+    cv::resize(src_image, resized_image, cv::Size(RESIZE_WIDTH, RESIZE_HEIGHT), 0, 0, cv::INTER_LINEAR);
+
+    int top = (RESIZE_HEIGHT - CROP_HEIGHT) / 2;
+    int left = (RESIZE_WIDTH - CROP_WIDTH) / 2;
+    cv::Rect roi(left, top, CROP_WIDTH, CROP_HEIGHT);
     cv::Mat cropped_image = resized_image(roi).clone();
 
-    // Convert from BGR to RGB
-    cv::Mat rgb;
-    cv::cvtColor(cropped_image, rgb, cv::COLOR_BGR2RGB);
-
-    // Convert to float32 and scale pixel values from [0, 255] to [0.0, 1.0]
     cv::Mat float_img;
-    rgb.convertTo(float_img, CV_32F, 1.0 / 255.0);
+    cropped_image.convertTo(float_img, CV_32F, 1.0 / 255.0);
 
     return float_img;
 }
 
+// Thread 1: preprocessing
+void preprocessingThread(
+    const std::string& input_dir, 
+    BoundedThreadSafeQueue<std::shared_ptr<BatchData>>& queue_out,
+    PerformanceMetrics& metrics
+) {
+    auto current_batch = std::make_shared<BatchData>();
+    current_batch->original_images.reserve(BATCH_SIZE);
+    current_batch->filenames.reserve(BATCH_SIZE);
+
+    std::vector<cv::Mat> temp_preprocessed_images;
+    temp_preprocessed_images.reserve(BATCH_SIZE);
+
+    for (const auto& entry : fs::directory_iterator(input_dir)) {
+        if (!g_is_running) break;
+
+        if (entry.is_regular_file()) {
+            auto start_loading = std::chrono::high_resolution_clock::now();
+            cv::Mat image = cv::imread(entry.path().string(), cv::IMREAD_COLOR_RGB);
+            auto end_loading = std::chrono::high_resolution_clock::now();
+            metrics.loading_times.push_back(std::chrono::duration<double, std::milli>(end_loading - start_loading).count());
+
+            if (image.empty()) continue;
+
+            current_batch->original_images.push_back(image.clone());
+            auto start_preprocessing = std::chrono::high_resolution_clock::now();
+            temp_preprocessed_images.push_back(preprocessImage(image));
+            auto end_preprocessing = std::chrono::high_resolution_clock::now();
+            metrics.preprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_preprocessing - start_preprocessing).count());
+            current_batch->filenames.push_back(entry.path().filename().string());
+
+            if (temp_preprocessed_images.size() == BATCH_SIZE) {
+                current_batch->valid_images = BATCH_SIZE;
+
+                auto start_batch = std::chrono::high_resolution_clock::now();
+                current_batch->blob = cv::dnn::blobFromImages(
+                    temp_preprocessed_images, 1.0, cv::Size(CROP_WIDTH, CROP_HEIGHT), cv::Scalar(), false, false, CV_32F
+                );
+
+                if (!current_batch->blob.isContinuous()) {
+                    current_batch->blob = current_batch->blob.clone();
+                }
+                auto end_batch = std::chrono::high_resolution_clock::now();
+                metrics.batch_prep_times.push_back(std::chrono::duration<double, std::milli>(end_batch - start_batch).count());
+                if (!queue_out.push(current_batch)) break;
+
+                current_batch = std::make_shared<BatchData>();
+                current_batch->original_images.reserve(BATCH_SIZE);
+                current_batch->filenames.reserve(BATCH_SIZE);
+                temp_preprocessed_images.clear();
+            }
+        }
+    }
+
+    if (!temp_preprocessed_images.empty()) {
+        current_batch->valid_images = temp_preprocessed_images.size();
+
+        while (temp_preprocessed_images.size() < BATCH_SIZE) {
+            temp_preprocessed_images.push_back(temp_preprocessed_images.back().clone());
+        }
+
+        auto start_batch = std::chrono::high_resolution_clock::now();
+        current_batch->blob = cv::dnn::blobFromImages(
+            temp_preprocessed_images, 1.0, cv::Size(CROP_WIDTH, CROP_HEIGHT), cv::Scalar(), false, false, CV_32F
+        );
+        if (!current_batch->blob.isContinuous()) current_batch->blob = current_batch->blob.clone();
+        auto end_batch = std::chrono::high_resolution_clock::now();
+        metrics.batch_prep_times.push_back(std::chrono::duration<double, std::milli>(end_batch - start_batch).count());
+
+        queue_out.push(current_batch);
+    }
+}
+
+// Thread 2: inference
+void inferenceThread(Ort::Session& session,
+    std::vector<const char*> input_names,
+    std::vector<const char*> output_names,
+    std::vector<int64_t> base_input_shape,
+    BoundedThreadSafeQueue<std::shared_ptr<BatchData>>& queue_in,
+    BoundedThreadSafeQueue<std::shared_ptr<InferenceResult>>& queue_out,
+    PerformanceMetrics& metrics
+) {
+
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::vector<int64_t> current_input_shape = base_input_shape;
+    current_input_shape[0] = BATCH_SIZE;
+
+    while (g_is_running) {
+        std::shared_ptr<BatchData> batch;
+
+        if (!queue_in.pop(batch)) break;
+
+        // ZERO-COPY TENSOR CREATION
+        // Directly use the memory address of the pre-built blob.
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info,
+            reinterpret_cast<float*>(batch->blob.data),
+            batch->blob.total(),
+            current_input_shape.data(),
+            current_input_shape.size()
+        );
+
+        auto start_gpu = std::chrono::high_resolution_clock::now();
+        // Execute GPU Inference
+        auto output_tensors = session.Run(
+            Ort::RunOptions{ nullptr },
+            input_names.data(),
+            &input_tensor,
+            1,
+            output_names.data(),
+            output_names.size()
+        );
+        auto end_gpu = std::chrono::high_resolution_clock::now();
+        metrics.gpu_times.push_back(std::chrono::duration<double, std::milli>(end_gpu - start_gpu).count());
+
+        auto result = std::make_shared<InferenceResult>();
+        result->batch_info = batch;
+
+        float* pred_scores = nullptr;
+        float* anomaly_maps = nullptr;
+
+        for (size_t i = 0; i < output_tensors.size(); ++i) {
+            std::string node_name = output_names[i];
+            auto shape = output_tensors[i].GetTensorTypeAndShapeInfo().GetShape();
+
+            if (node_name.find("score") != std::string::npos) {
+                pred_scores = output_tensors[i].GetTensorMutableData<float>();
+                result->pred_scores.assign(pred_scores, pred_scores + BATCH_SIZE);
+            }
+            else if (node_name.find("map") != std::string::npos) {
+                anomaly_maps = output_tensors[i].GetTensorMutableData<float>();
+                result->map_h = shape[shape.size() - 2];
+                result->map_w = shape[shape.size() - 1];
+                
+                size_t total_elements = output_tensors[i].GetTensorTypeAndShapeInfo().GetElementCount();
+                result->anomaly_maps.assign(anomaly_maps, anomaly_maps + total_elements);
+            }
+            else if (node_name.find("mask") != std::string::npos) {
+                bool* pred_masks = output_tensors[i].GetTensorMutableData<bool>();
+                result->mask_h = shape[shape.size() - 2];
+                result->mask_w = shape[shape.size() - 1];
+
+                size_t total_elements = output_tensors[i].GetTensorTypeAndShapeInfo().GetElementCount();
+
+                result->pred_masks.resize(total_elements);
+                for (size_t k = 0; k < total_elements; ++k) {
+                    result->pred_masks[k] = pred_masks[k] ? 255 : 0;
+                }
+                result->has_masks = true;
+            }
+        }
+        if (!queue_out.push(result)) break;
+    }
+}
+
+// Thread 3: postprocessing
+void postprocessingThread(
+    const std::string& output_dir,
+    BoundedThreadSafeQueue<std::shared_ptr<InferenceResult>>& queue_in,
+    PerformanceMetrics& metrics
+) {
+
+    while (g_is_running) {
+        std::shared_ptr<InferenceResult> result;
+
+        if (!queue_in.pop(result)) break;
+
+        int valid_image_count = result->batch_info->valid_images;
+        int map_area = result->map_h * result->map_w;
+
+        for (int j = 0; j < valid_image_count; j++) {
+            auto start_post = std::chrono::high_resolution_clock::now();
+            // Extract original image
+            cv::Mat original_rgb = result->batch_info->original_images[j];
+            cv::Mat original_bgr;
+            cv::cvtColor(original_rgb, original_bgr, cv::COLOR_RGB2BGR);
+
+            float score = result->pred_scores[j];
+            std::string filename = result->batch_info->filenames[j];
+
+            // Heatmap overlay
+            int map_area = result->map_h * result->map_w;
+
+            size_t elements_per_item = result->anomaly_maps.size() / valid_image_count;
+            int offset_map = j * elements_per_item;
+
+            cv::Mat map_anomaly(result->map_h, result->map_w, CV_32F, result->anomaly_maps.data() + offset_map);
+
+            if (map_anomaly.empty() || map_anomaly.dims != 2) {
+                fmt::print(stderr, "Error: Reconstructed anomaly map is invalid for image {}\n", filename);
+                continue;
+            }
+
+            cv::Mat heatmap_norm, heatmap_colored, overlay_img;
+            cv::normalize(map_anomaly, heatmap_norm, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+            cv::applyColorMap(heatmap_norm, heatmap_colored, cv::COLORMAP_JET);
+
+            if (heatmap_colored.size() != original_bgr.size()) {
+                cv::resize(heatmap_colored, heatmap_colored, original_bgr.size(), 0, 0, cv::INTER_CUBIC);
+            }
+            cv::addWeighted(original_bgr, 0.5, heatmap_colored, 0.5, 0, overlay_img);
+
+            // Defect highlight
+            cv::Mat segmentation_img = original_bgr.clone();
+            std::vector<std::vector<cv::Point>> contours;
+
+            if (result->has_masks) {
+                int offset_mask = j * (result->mask_h * result->mask_w);
+                cv::Mat mask_uint8(result->mask_h, result->mask_w, CV_8U, result->pred_masks.data() + offset_mask);
+
+                if (mask_uint8.size() != original_bgr.size()) {
+                    cv::resize(mask_uint8, mask_uint8, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
+                }
+                cv::findContours(mask_uint8, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            }
+            else {
+                cv::Mat mask_from_map;
+                cv::threshold(heatmap_norm, mask_from_map, 128, 255, cv::THRESH_BINARY);
+                if (mask_from_map.size() != original_bgr.size()) {
+                    cv::resize(mask_from_map, mask_from_map, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
+                }
+                cv::findContours(mask_from_map, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            }
+
+            cv::drawContours(segmentation_img, contours, -1, cv::Scalar(0, 0, 255), 2);
+            cv::drawContours(overlay_img, contours, -1, cv::Scalar(0, 0, 255), 2);
+
+            // Add score text overlay
+            std::string score_text = fmt::format("Score: {:.4f}", score);
+            cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+            cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+
+            // Triple Concatenation
+            cv::Mat combined_result;
+            std::vector<cv::Mat> images_to_concat = { original_bgr, overlay_img, segmentation_img };
+            cv::hconcat(images_to_concat, combined_result);
+            auto end_post = std::chrono::high_resolution_clock::now();
+            metrics.postprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_post - start_post).count());
+
+
+            auto start_down = std::chrono::high_resolution_clock::now();
+            std::string save_name = fmt::format("{:.3f}_{}", score, filename);
+            std::string out_path = (fs::path(output_dir) / save_name).string();
+            cv::imwrite(out_path, combined_result);
+            auto end_down = std::chrono::high_resolution_clock::now();
+            metrics.downloading_times.push_back(std::chrono::duration<double, std::milli>(end_down - start_down).count());
+        }
+    }
+}
+
 /*
 Parameters:
-	- argv[1]: Path to the TensorRT engine cache directory (e.g., "D:\\tensorrt_cache")
-	- argv[2]: Path to the ONNX model (e.g., "D:\\emanuele\\Code\\inference-gpu\\model\\20260407_173343_EfficientAd_wide_resnet50_2.onnx")
-	- argv[3]: Path to the input images directory (e.g., "D:\\emanuele\\Code\\inference-gpu\\images")
-	- argv[4]: Path to the output directory (e.g., "D:\\emanuele\\Code\\inference-gpu\\output")
+    - argv[1]: Path to the TensorRT engine cache directory (e.g., "D:\\tensorrt_cache")
+    - argv[2]: Path to the ONNX model (e.g., "D:\\emanuele\\Code\\inference-gpu\\model\\20260407_173343_EfficientAd_wide_resnet50_2.onnx")
+    - argv[3]: Path to the input images directory (e.g., "D:\\emanuele\\Code\\inference-gpu\\images")
+    - argv[4]: Path to the output directory (e.g., "D:\\emanuele\\Code\\inference-gpu\\output")
 */
 int main(int argc, char* argv[]) {
     if (argc < 5) {
@@ -51,38 +382,18 @@ int main(int argc, char* argv[]) {
     fs::path input_dir_path(argv[3]);
     fs::path output_dir_path(argv[4]);
 
-    if (!fs::exists(model_file_path)) {
-        fmt::print(stderr, "Error: Model file does not exist: {}\n", model_file_path.string());
+    if (!fs::exists(model_file_path) || !fs::is_regular_file(model_file_path)) {
+        fmt::print(stderr, "Error: Model file does not exist or is not a file: {}\n", model_file_path.string());
         return -1;
     }
-    if (!fs::is_regular_file(model_file_path)) {
-        fmt::print(stderr, "Error: Model path provided is not a file: {}\n", model_file_path.string());
-        return -1;
-    }
-    if (model_file_path.extension() != ".onnx") {
-        fmt::print(stderr, "Warning: Expected a .onnx extension, but got: {}\n", model_file_path.extension().string());
-    }
-
-    if (!fs::exists(input_dir_path)) {
-        fmt::print(stderr, "Error: Input images directory does not exist: {}\n", input_dir_path.string());
-        return -1;
-    }
-    if (!fs::is_directory(input_dir_path)) {
-        fmt::print(stderr, "Error: Input path is not a directory: {}\n", input_dir_path.string());
-        return -1;
-    }
-    if (fs::is_empty(input_dir_path)) {
-        fmt::print(stderr, "Error: Input directory is empty. No images to process.\n");
+    if (!fs::exists(input_dir_path) || !fs::is_directory(input_dir_path) || fs::is_empty(input_dir_path)) {
+        fmt::print(stderr, "Error: Input directory is invalid or empty: {}\n", input_dir_path.string());
         return -1;
     }
 
     try {
-        if (!fs::exists(trt_cache_path)) {
-            fs::create_directories(trt_cache_path);
-        }
-        if (!fs::exists(output_dir_path)) {
-            fs::create_directories(output_dir_path);
-        }
+        if (!fs::exists(trt_cache_path)) fs::create_directories(trt_cache_path);
+        if (!fs::exists(output_dir_path)) fs::create_directories(output_dir_path);
     }
     catch (const fs::filesystem_error& e) {
         fmt::print(stderr, "Filesystem error while creating directories: {}\n", e.what());
@@ -91,43 +402,29 @@ int main(int argc, char* argv[]) {
 
     std::wstring model_path_ws = model_file_path.wstring();
     std::string trt_cache_str = trt_cache_path.string();
-	std::string output_dir_str = output_dir_path.string();
-	std::string input_dir_str = input_dir_path.string();
+    std::string output_dir_str = output_dir_path.string();
+    std::string input_dir_str = input_dir_path.string();
 
-    // Preprocessing configuration parameters
-    const int BATCH_SIZE = 17;
-    const int RESIZE_WIDTH = 256;
-    const int RESIZE_HEIGHT = 256;
-
-    // Set crop dimensions equal to resize dimensions to match the ONNX expected input shape
-    const int CROP_WIDTH = 256;
-    const int CROP_HEIGHT = 256;
-
-    // Environment and Session Options Initialization
+    // ONNX Runtime inizialization
     Ort::Env inferenceEnv(ORT_LOGGING_LEVEL_WARNING, "GpuInference");
     Ort::SessionOptions session_options;
 
-	// Enable TensorRT provider with FP16 precision and engine caching for optimal GPU performance
+    // Enable TensorRT
     OrtTensorRTProviderOptions trt_options{};
-	trt_options.device_id = 0;
+    trt_options.device_id = 0;
     trt_options.trt_fp16_enable = 1;
-	trt_options.trt_engine_cache_enable = 1;
-	trt_options.trt_engine_cache_path = trt_cache_str.c_str();
-    
-
-    if (!fs::exists(trt_options.trt_engine_cache_path)) {
-		fs::create_directories(trt_options.trt_engine_cache_path);
-    }
+    trt_options.trt_engine_cache_enable = 1;
+    trt_options.trt_engine_cache_path = trt_cache_str.c_str();
 
     try {
         session_options.AppendExecutionProvider_TensorRT(trt_options);
     }
-    catch (const std::exception& e) {    
+    catch (const std::exception& e) {
         fmt::print(stderr, "TensorRT not supported or DLL missing: {}\n", e.what());
         return -1;
     }
 
-	// Enable CUDA provider and configure memory optimizations as backup if TensorRT is unavailable
+    // Enable CUDA as fallback
     OrtCUDAProviderOptions cuda_options{};
     cuda_options.device_id = 0;
     cuda_options.arena_extend_strategy = 1;
@@ -143,13 +440,12 @@ int main(int argc, char* argv[]) {
 
     session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-
     session_options.AddConfigEntry("session.free_memory_dimension_overrides", "1");
     session_options.AddConfigEntry("session.memory.enable_memory_arena_shrinkage", "gpu:0");
     session_options.AddConfigEntry("session.use_env_allocators", "0");
 
-    const wchar_t* model_path = model_path_ws.c_str();
     try {
+        const wchar_t* model_path = model_path_ws.c_str();
         Ort::Session session(inferenceEnv, model_path, session_options);
         fmt::print("Model loaded successfully on GPU!\n");
 
@@ -163,323 +459,91 @@ int main(int argc, char* argv[]) {
         // Extract output node information dynamically
         size_t num_output_nodes = session.GetOutputCount();
         std::vector<std::string> output_names_str;
+        std::vector<const char*> output_names;
         output_names_str.reserve(num_output_nodes);
+        output_names.reserve(num_output_nodes);
+
         for (size_t i = 0; i < num_output_nodes; i++) {
             auto output_name_ptr = session.GetOutputNameAllocated(i, allocator);
             output_names_str.push_back(output_name_ptr.get());
+            output_names.push_back(output_names_str.back().c_str());
         }
 
-        std::vector<const char*> output_names;
-        output_names.reserve(num_output_nodes);
-        for (const auto& name : output_names_str) {
-            output_names.push_back(name.c_str());
-        }
+        std::vector<const char*> input_names = { input_name.c_str() };
 
-        const char* input_names[] = { input_name.c_str() };
-
-        std::string target_directory = input_dir_str;
-        std::string output_directory = output_dir_str;
-
-        if (!fs::exists(output_directory)) {
-            fs::create_directories(output_directory);
-        }
-
+        // GPU warm-up
         fmt::print("Executing GPU Warm-up...\n");
-
         const int WARMUP_ITERATIONS = 3;
-
         std::vector<int64_t> warmup_shape = base_input_shape;
         warmup_shape[0] = BATCH_SIZE;
 
         size_t warmup_tensor_size = BATCH_SIZE * 3 * CROP_HEIGHT * CROP_WIDTH;
         std::vector<float> dummy_data(warmup_tensor_size, 0.0f);
-
         auto warmup_memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
         Ort::Value dummy_tensor = Ort::Value::CreateTensor<float>(
-            warmup_memory_info,
-            dummy_data.data(),
-            dummy_data.size(),
-            warmup_shape.data(),
-            warmup_shape.size()
+            warmup_memory_info, dummy_data.data(), dummy_data.size(), warmup_shape.data(), warmup_shape.size()
         );
 
-        // Run empty inferences to wake up Tensor Cores and allocate VRAM buffers
         for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
-            auto w_start = std::chrono::high_resolution_clock::now();
-
-            session.Run(
-                Ort::RunOptions{ nullptr },
-                input_names,
-                &dummy_tensor,
-                1,
-                output_names.data(),
-                output_names.size()
-            );
-
-            auto w_end = std::chrono::high_resolution_clock::now();
-            fmt::print("  - Warm-up step {}/{} completed in {} ms\n",
-                i + 1,
-                WARMUP_ITERATIONS,
-                std::chrono::duration_cast<std::chrono::milliseconds>(w_end - w_start).count()
-            );
+            session.Run(Ort::RunOptions{ nullptr }, input_names.data(), &dummy_tensor, 1, output_names.data(), output_names.size());
         }
         fmt::print("GPU Warm-up completed. Tensor Cores are ready.\n\n");
 
-        std::vector<double> gpu_times;
-		std::vector<double> postprocessing_times;
-        std::vector<double> loading_times;
-		std::vector<double> downloading_times;
-		std::vector<double> preprocessing_times;
-		std::vector<double> batch_prep_times;
+        // Multithreading pipiline
+        fmt::print("Starting Producer-Consumer Pipeline...\n");
+        auto start_pipeline = std::chrono::high_resolution_clock::now();
 
-        // Inference Lambda Function with Dynamic Shape Padding
-        auto runInference = [&](std::vector<cv::Mat>& images, std::vector<cv::Mat>& orig_images, std::vector<std::string>& filenames, int batch_index) {
-            if (images.empty()) return;
+        // Initialize queues
+        BoundedThreadSafeQueue<std::shared_ptr<BatchData>> q_preprocessed(5);
+        BoundedThreadSafeQueue<std::shared_ptr<InferenceResult>> q_inferred(10);
+        PerformanceMetrics metrics;
 
-            // Keep track of how many real images we actually have
-            int valid_image_count = images.size();
+        // Start threads
+        std::thread t1(preprocessingThread, input_dir_str, std::ref(q_preprocessed), std::ref(metrics));
+        std::thread t2(inferenceThread, std::ref(session), input_names, output_names, base_input_shape, std::ref(q_preprocessed), std::ref(q_inferred), std::ref(metrics));
+        std::thread t3(postprocessingThread, output_dir_str, std::ref(q_inferred), std::ref(metrics));
 
-            // BATCH PADDING
-            while (images.size() < BATCH_SIZE) {
-                images.push_back(images.back().clone());
-            }
+        
+        t1.join();
+        fmt::print("Thread 1 (Preprocessing) finished reading all files.\n");
 
-            int current_batch_size = images.size();
-            fmt::print("\nExecuting inference for batch {} ({} real images, padded to {})\n", batch_index, valid_image_count, current_batch_size);
+        q_preprocessed.stop();
+        t2.join();
+        fmt::print("Thread 2 (GPU Inference) finished processing all batches.\n");
 
-            auto start_batch_prep = std::chrono::high_resolution_clock::now();
-            cv::Mat blob = cv::dnn::blobFromImages(images, 1.0, cv::Size(CROP_WIDTH, CROP_HEIGHT), cv::Scalar(), false, false, CV_32F);
-            if (!blob.isContinuous()) {
-                blob = blob.clone();
-            }
+        q_inferred.stop();
+        t3.join();
+        fmt::print("Thread 3 (Postprocessing) finished saving all results.\n");
 
-            std::vector<int64_t> current_input_shape = base_input_shape;
-            current_input_shape[0] = current_batch_size;
+        auto end_pipeline = std::chrono::high_resolution_clock::now();
+        double total_time_ms = std::chrono::duration<double, std::milli>(end_pipeline - start_pipeline).count();
 
-            auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-            Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, reinterpret_cast<float*>(blob.data), blob.total(), current_input_shape.data(), current_input_shape.size());
-            auto end_batch_prep = std::chrono::high_resolution_clock::now();
-            double prep_time = std::chrono::duration<double, std::milli>(end_batch_prep - start_batch_prep).count();
-            batch_prep_times.push_back(prep_time);
-
-            auto start_time = std::chrono::high_resolution_clock::now();
-
-            auto output_tensors = session.Run(
-                Ort::RunOptions{ nullptr }, input_names, &input_tensor, 1, output_names.data(), output_names.size()
-            );
-
-            auto end_time = std::chrono::high_resolution_clock::now();
-			auto inference_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-            gpu_times.push_back(inference_time);
-
-            // Output data pointers
-            float* pred_scores = nullptr;
-            float* anomaly_maps = nullptr;
-            bool* pred_masks = nullptr;
-
-            int out_map_h = CROP_HEIGHT, out_map_w = CROP_WIDTH;
-            int out_mask_h = CROP_HEIGHT, out_mask_w = CROP_WIDTH;
-            for (size_t i = 0; i < output_tensors.size(); ++i) {
-                std::string node_name = output_names_str[i];
-                std::transform(node_name.begin(), node_name.end(), node_name.begin(), ::tolower);
-
-                auto shape = output_tensors[i].GetTensorTypeAndShapeInfo().GetShape();
-
-                if (node_name.find("score") != std::string::npos) {
-                    pred_scores = output_tensors[i].GetTensorMutableData<float>();
-                }
-                else if (node_name.find("map") != std::string::npos) {
-                    anomaly_maps = output_tensors[i].GetTensorMutableData<float>();
-                    if (shape.size() >= 2) {
-                        out_map_h = shape[shape.size() - 2];
-                        out_map_w = shape[shape.size() - 1];
-                    }
-                }
-                else if (node_name.find("mask") != std::string::npos) {
-                    pred_masks = output_tensors[i].GetTensorMutableData<bool>();
-                    if (shape.size() >= 2) {
-                        out_mask_h = shape[shape.size() - 2];
-                        out_mask_w = shape[shape.size() - 1];
-                    }
-                }
-            }
-
-            if (!pred_scores || !anomaly_maps) {
-                fmt::print(stderr, "Critical Error: 'score' or 'map' tensors not found.\n");
-                return;
-            }
-
-            int map_area = out_map_h * out_map_w;
-            int mask_area = out_mask_h * out_mask_w;
-
-            // OUTPUT SAVING
-            for (int j = 0; j < valid_image_count; j++) {
-                auto start_post = std::chrono::high_resolution_clock::now();
-                fmt::print("File: {} | Predicted Score: {:.4f}\n", filenames[j], pred_scores[j]);
-
-                cv::Mat original_bgr = orig_images[j].clone();
-
-                // PROCESS ANOMALY HEATMAP
-                int offset_map = j * map_area;
-                cv::Mat map_anomaly(out_map_h, out_map_w, CV_32F, anomaly_maps + offset_map);
-
-                // Normalize heatmap using MinMax
-                cv::Mat heatmap_norm;
-                cv::normalize(map_anomaly, heatmap_norm, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-
-                // Apply Jet colormap
-                cv::Mat heatmap_colored;
-                cv::applyColorMap(heatmap_norm, heatmap_colored, cv::COLORMAP_JET);
-
-                if (heatmap_colored.size() != original_bgr.size()) {
-                    cv::resize(heatmap_colored, heatmap_colored, original_bgr.size(), 0, 0, cv::INTER_CUBIC);
-                }
-
-                cv::Mat overlay_img;
-                cv::addWeighted(original_bgr, 0.5, heatmap_colored, 0.5, 0, overlay_img);
-
-                std::string score_text = fmt::format("Anomaly score: {:.4f}", pred_scores[j]);
-                cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
-                cv::putText(overlay_img, score_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-
-                // PROCESS PREDICTION MASK AND CONTOUR
-                cv::Mat segmentation_img = original_bgr.clone();
-
-                if (pred_masks) {
-                    int offset_mask = j * mask_area;
-                    cv::Mat mask_pred(out_mask_h, out_mask_w, CV_8U, pred_masks + offset_mask);
-                    cv::Mat mask_uint8;
-
-                    // Convert binary mask to uint8 format
-                    double max_val;
-                    cv::minMaxLoc(mask_pred, nullptr, &max_val);
-                    if (max_val <= 1.0) {
-                        mask_pred.convertTo(mask_uint8, CV_8UC1, 255.0);
-                    }
-                    else {
-                        mask_pred.copyTo(mask_uint8);
-                    }
-
-                    if (mask_uint8.size() != original_bgr.size()) {
-                        cv::resize(mask_uint8, mask_uint8, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
-                    }
-
-                    // Extract boundaries and draw them
-                    std::vector<std::vector<cv::Point>> contours;
-                    cv::findContours(mask_uint8, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-                    cv::drawContours(segmentation_img, contours, -1, cv::Scalar(0, 0, 255), 2);
-                    cv::drawContours(overlay_img, contours, -1, cv::Scalar(0, 0, 255), 2);
-                }
-
-                
-                // CONCATENATE IMAGES
-                cv::Mat combined_result;
-                std::vector<cv::Mat> images_to_concat = { original_bgr, overlay_img, segmentation_img };
-                cv::hconcat(images_to_concat, combined_result);
-
-                auto end_post = std::chrono::high_resolution_clock::now();
-                double duration_postprocessing = std::chrono::duration<double, std::milli>(end_post - start_post).count();
-                postprocessing_times.push_back(duration_postprocessing);
-
-                // SAVE IMAGE TO DISK
-                auto start_downloading = std::chrono::high_resolution_clock::now();
-
-                std::string base_name = fs::path(filenames[j]).filename().string();
-               
-                std::string save_name = fmt::format("{:.3f}_{}", pred_scores[j], base_name);
-                std::string out_path = (fs::path(output_directory) / save_name).string();
-
-                cv::imwrite(out_path, combined_result);
-
-                auto end_downloading = std::chrono::high_resolution_clock::now();
-                auto downloading_time = std::chrono::duration<double, std::milli>(end_downloading - start_downloading).count();
-                downloading_times.push_back(downloading_time);
-            }
-
-            images.clear();
-            orig_images.clear();
-            filenames.clear();
-        };
-
-        std::vector<cv::Mat> current_batch_images;
-        std::vector<cv::Mat> current_original_images;
-        std::vector<std::string> current_batch_filenames;
-
-        current_batch_images.reserve(BATCH_SIZE);
-        current_original_images.reserve(BATCH_SIZE);
-        current_batch_filenames.reserve(BATCH_SIZE);
-
-        int batch_counter = 0;
-
-        fmt::print("Scanning directory and preprocessing on-the-fly...\n");
-        for (const auto& entry : fs::directory_iterator(target_directory)) {
-            if (entry.is_regular_file()) {
-                std::string file_path = entry.path().string();
-                std::string filename = entry.path().filename().string();
-
-                // Read image explicitly in 3-channel BGR mode
-				auto start_loading = std::chrono::high_resolution_clock::now();
-                cv::Mat image = cv::imread(file_path, cv::IMREAD_COLOR);
-				auto end_loading = std::chrono::high_resolution_clock::now();
-				auto loading_time = std::chrono::duration<double, std::milli>(end_loading - start_loading).count();
-				loading_times.push_back(loading_time);
-
-                if (image.empty()) {
-                    fmt::print(stderr, "Cannot read image: {}\n", file_path);
-                    continue;
-                }
-
-                current_original_images.push_back(image.clone());
-
-				auto start_preprocessing = std::chrono::high_resolution_clock::now();
-                cv::Mat preprocessed_image = preprocessImage(image, RESIZE_WIDTH, RESIZE_HEIGHT, CROP_WIDTH, CROP_HEIGHT);
-				auto end_preprocessing = std::chrono::high_resolution_clock::now();
-                double duration_preprocessing = std::chrono::duration<double, std::milli>(end_preprocessing - start_preprocessing).count();
-                preprocessing_times.push_back(duration_preprocessing);
-
-                current_batch_images.push_back(preprocessed_image);
-                current_batch_filenames.push_back(filename);
-
-                // Trigger inference if the batch buffer is full
-                if (current_batch_images.size() == BATCH_SIZE) {
-                    runInference(current_batch_images, current_original_images, current_batch_filenames, batch_counter++);
-                }
-            }
-        }
-
-        // Process any remaining images in the last incomplete batch
-        if (!current_batch_images.empty()) {
-            runInference(current_batch_images, current_original_images, current_batch_filenames, batch_counter++);
-        }
-
+        // Avg calculation lambda function
         auto calc_avg = [](const std::vector<double>& times) -> double {
             if (times.empty()) return 0.0;
-            double sum = std::accumulate(times.begin(), times.end(), 0.0);
-            return sum / times.size();
+            return std::accumulate(times.begin(), times.end(), 0.0) / times.size();
         };
 
-        double avg_loading = calc_avg(loading_times);
-        double avg_preprocessing = calc_avg(preprocessing_times);
-        double avg_postprocessing = calc_avg(postprocessing_times);
-        double avg_downloading = calc_avg(downloading_times);
 
-        double avg_batch_prep = calc_avg(batch_prep_times) / BATCH_SIZE;
 
-        double avg_gpu_batch = calc_avg(gpu_times);
+        double avg_loading = calc_avg(metrics.loading_times);
+        double avg_preprocessing = calc_avg(metrics.preprocessing_times);
+        double avg_batch_prep = calc_avg(metrics.batch_prep_times) / BATCH_SIZE;
+        double avg_gpu_batch = calc_avg(metrics.gpu_times);
         double avg_gpu_per_image = avg_gpu_batch / BATCH_SIZE;
+        double avg_postprocessing = calc_avg(metrics.postprocessing_times);
+        double avg_downloading = calc_avg(metrics.downloading_times);
 
-        double total_pipeline_per_image = avg_loading + avg_preprocessing + avg_batch_prep + avg_gpu_per_image + avg_postprocessing + avg_downloading;
+        int total_images = metrics.loading_times.size();
 
-        fmt::print("\nInference completed successfully!\n");
         fmt::print("\n========================================\n");
         fmt::print("        DETAILED PERFORMANCE REPORT      \n");
         fmt::print("========================================\n");
         fmt::print("Batch Size used: {}\n", BATCH_SIZE);
-        fmt::print("Total Batches processed: {}\n", batch_counter);
-        fmt::print("Total Images processed: {}\n", loading_times.size());
+        fmt::print("Total Images processed: {}\n", total_images);
         fmt::print("----------------------------------------\n");
-        fmt::print("Average Times per SINGLE Image:\n");
+        fmt::print("Average Times per SINGLE Image (in Thread):\n");
         fmt::print("  - Loading (Disk -> RAM)  : {:.3f} ms\n", avg_loading);
         fmt::print("  - Preprocessing (CPU)    : {:.3f} ms\n", avg_preprocessing);
         fmt::print("  - Batch Prep (CPU Memory): {:.3f} ms\n", avg_batch_prep);
@@ -487,9 +551,17 @@ int main(int argc, char* argv[]) {
         fmt::print("  - Postprocessing (CPU)   : {:.3f} ms\n", avg_postprocessing);
         fmt::print("  - Downloading (RAM->Disk): {:.3f} ms\n", avg_downloading);
         fmt::print("----------------------------------------\n");
-        fmt::print("  TOTAL Pipeline Time/Image: {:.3f} ms\n", total_pipeline_per_image);
-        fmt::print("  Estimated Throughput     : {:.2f} FPS\n", 1000.0 / total_pipeline_per_image);
+
+        double t1_cost = avg_loading + avg_preprocessing + avg_batch_prep;
+        double t2_cost = avg_gpu_per_image;
+        double t3_cost = avg_postprocessing + avg_downloading;
+        double bottleneck = std::max({ t1_cost, t2_cost, t3_cost });
+
+        fmt::print("Total Real-World Pipeline Time: {:.2f} ms\n", total_time_ms);
+        fmt::print("Theoretical Max Throughput    : {:.2f} FPS (Limited by slowest thread: {:.3f} ms/img)\n", 1000.0 / bottleneck, bottleneck);
+        fmt::print("Actual Measured Throughput    : {:.2f} FPS\n", (total_images * 1000.0) / total_time_ms);
         fmt::print("========================================\n");
+
     }
     catch (const Ort::Exception& e) {
         fmt::print(stderr, "Model loading error: {}\n", e.what());
@@ -499,5 +571,6 @@ int main(int argc, char* argv[]) {
         fmt::print(stderr, "General error: {}\n", e.what());
         return -1;
     }
+
     return 0;
 }
