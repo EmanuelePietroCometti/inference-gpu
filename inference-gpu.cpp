@@ -105,8 +105,11 @@ cv::Mat preprocessImage(const cv::Mat& src_image) {
     cv::Rect roi(left, top, CROP_WIDTH, CROP_HEIGHT);
     cv::Mat cropped_image = resized_image(roi).clone();
 
+    cv::Mat rgb_float;
+    cv::cvtColor(cropped_image, rgb_float, cv::COLOR_BGR2RGB);
+
     cv::Mat float_img;
-    cropped_image.convertTo(float_img, CV_32F, 1.0 / 255.0);
+    rgb_float.convertTo(float_img, CV_32F, 1.0 / 255.0);
 
     return float_img;
 }
@@ -146,7 +149,7 @@ void preprocessingThread(
 
                 cv::parallel_for_(cv::Range(0, BATCH_SIZE), [&](const cv::Range& range) {
                     for (int i = range.start; i < range.end; i++) {
-                        cv::Mat image = cv::imread(batch_filepaths[i], cv::IMREAD_COLOR_RGB);
+                        cv::Mat image = cv::imread(batch_filepaths[i], cv::IMREAD_COLOR);
 
                         if (image.empty()) {
                             fmt::print(stderr, "Warning: Corrupted image replaced with dummy: {}\n", batch_filepaths[i]);
@@ -312,60 +315,45 @@ void postprocessingThread(
         if (!queue_in.pop(result)) break;
 
         int valid_image_count = result->batch_info->valid_images;
-
         auto start_post = std::chrono::high_resolution_clock::now();
 
         cv::parallel_for_(cv::Range(0, valid_image_count), [&](const cv::Range& range) {
             for (int j = range.start; j < range.end; j++) {
 
-                cv::Mat original_rgb = result->batch_info->original_images[j];
-                cv::Mat original_bgr;
-                cv::cvtColor(original_rgb, original_bgr, cv::COLOR_RGB2BGR);
-
+                cv::Mat original_bgr = result->batch_info->original_images[j];
                 float score = result->pred_scores[j];
                 std::string filename = result->batch_info->filenames[j];
 
                 size_t elements_per_item = result->anomaly_maps.size() / BATCH_SIZE;
                 int offset_map = j * elements_per_item;
-
                 cv::Mat map_anomaly(result->map_h, result->map_w, CV_32F, result->anomaly_maps.data() + offset_map);
 
-                if (map_anomaly.empty() || map_anomaly.dims != 2 || map_anomaly.size().area() == 0) {
-                    fmt::print(stderr, "Error: Invalid anomaly map generated for image {}\n", filename);
-                    continue;
-                }
+                if (map_anomaly.empty() || map_anomaly.dims != 2 || map_anomaly.size().area() == 0) continue;
 
                 cv::Mat heatmap_norm, heatmap_colored, overlay_img;
                 cv::normalize(map_anomaly, heatmap_norm, 0, 255, cv::NORM_MINMAX, CV_8UC1);
                 cv::applyColorMap(heatmap_norm, heatmap_colored, cv::COLORMAP_JET);
 
                 if (heatmap_colored.size() != original_bgr.size()) {
-                    cv::resize(heatmap_colored, heatmap_colored, original_bgr.size(), 0, 0, cv::INTER_CUBIC);
+                    cv::resize(heatmap_colored, heatmap_colored, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
                 }
                 cv::addWeighted(original_bgr, 0.5, heatmap_colored, 0.5, 0, overlay_img);
 
                 cv::Mat segmentation_img = original_bgr.clone();
+                cv::Mat binary_mask;
                 std::vector<std::vector<cv::Point>> contours;
 
                 if (result->has_masks) {
-                    size_t mask_elements_per_item = result->pred_masks.size() / BATCH_SIZE;
-                    int offset_mask = j * mask_elements_per_item;
-                    cv::Mat mask_uint8(result->mask_h, result->mask_w, CV_8U, result->pred_masks.data() + offset_mask);
-
-                    if (mask_uint8.size() != original_bgr.size()) {
-                        cv::resize(mask_uint8, mask_uint8, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
-                    }
-                    cv::findContours(mask_uint8, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                    size_t mask_elements = result->pred_masks.size() / BATCH_SIZE;
+                    cv::Mat raw_mask(result->mask_h, result->mask_w, CV_8U, result->pred_masks.data() + (j * mask_elements));
+                    cv::resize(raw_mask, binary_mask, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
                 }
                 else {
-                    cv::Mat mask_from_map;
-                    cv::threshold(heatmap_norm, mask_from_map, 128, 255, cv::THRESH_BINARY);
-                    if (mask_from_map.size() != original_bgr.size()) {
-                        cv::resize(mask_from_map, mask_from_map, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
-                    }
-                    cv::findContours(mask_from_map, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+                    cv::threshold(heatmap_norm, binary_mask, 150, 255, cv::THRESH_BINARY);
+                    cv::resize(binary_mask, binary_mask, original_bgr.size(), 0, 0, cv::INTER_NEAREST);
                 }
 
+                cv::findContours(binary_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
                 cv::drawContours(segmentation_img, contours, -1, cv::Scalar(0, 0, 255), 2);
 
                 std::string score_text = fmt::format("Anomaly score: {:.4f}", score);
@@ -376,13 +364,10 @@ void postprocessingThread(
                 std::vector<cv::Mat> images_to_concat = { original_bgr, overlay_img, segmentation_img };
                 cv::hconcat(images_to_concat, combined_result);
 
-                ;
-                std::string save_name = fmt::format("{}", filename);
-                std::string out_path = (fs::path(output_dir) / save_name).string();
-
+                std::string out_path = (fs::path(output_dir) / filename).string();
                 cv::imwrite(out_path, combined_result);
             }
-        });
+            });
 
         auto end_post = std::chrono::high_resolution_clock::now();
         metrics.postprocessing_times.push_back(std::chrono::duration<double, std::milli>(end_post - start_post).count());
