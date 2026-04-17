@@ -369,3 +369,4 @@ images/
 .vs/
 tensorrt_cache/
 output/
+*.bmp
