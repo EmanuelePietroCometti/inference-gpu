@@ -30,11 +30,11 @@ include_directories("${FMT_ROOT}/include")
 
 set(TENSORRT_ROOT "D:/emanuele/SDK/TensorRT-10.16.1.11")
 
+find_package(CUDAToolkit REQUIRED)
 set(CUDA_BIN_PATH "$ENV{CUDA_PATH}/bin/x64")
-set(CUDNN_BIN_PATH "${CUDA_BIN_PATH}") 
 
 # =====================================================================
-# TENSORRT DLL FILTERING LOGIC (For Installation Only)
+# TENSORRT DLL FILTERING LOGIC (for installation only)
 # =====================================================================
 file(GLOB TENSORRT_ALL_DLLS "${TENSORRT_ROOT}/bin/*.dll")
 
@@ -51,6 +51,35 @@ foreach(DLL_PATH IN LISTS TENSORRT_ALL_DLLS)
         list(APPEND TENSORRT_FILTERED_DLLS "${DLL_PATH}")
     endif()
 endforeach()
+
+file(GLOB OPENCV_ALL_DLLS "${OpenCV_DIR}/x64/vc16/bin/*.dll")
+set(OPENCV_RELEASE_DLLS "")
+foreach(DLL_PATH IN LISTS OPENCV_ALL_DLLS)
+    get_filename_component(DLL_NAME "${DLL_PATH}" NAME)
+    if(NOT DLL_NAME MATCHES "d\\.dll$") 
+        list(APPEND OPENCV_RELEASE_DLLS "${DLL_PATH}")
+    endif()
+endforeach()
+
+file(GLOB CUDA_ESSENTIAL_DLLS 
+    "${CUDA_BIN_PATH}/cudart64_*.dll"           
+    "${CUDA_BIN_PATH}/cublas64_*.dll"           
+    "${CUDA_BIN_PATH}/cublasLt64_*.dll"         
+    "${CUDA_BIN_PATH}/cudnn*.dll"
+    "${CUDA_BIN_PATH}/cufft64_*.dll"            
+    "${CUDA_BIN_PATH}/zlibwapi.dll"
+)
+
+file(GLOB ONNX_DLLS "${ONNX_ROOT}/lib/*.dll")
+file(GLOB FMT_RELEASE_DLLS "${FMT_ROOT}/build/bin/Release/fmt*.dll")
+
+set(ALL_RUNTIME_DLLS 
+    ${TENSORRT_FILTERED_DLLS}
+    ${OPENCV_RELEASE_DLLS}
+    ${CUDA_ESSENTIAL_DLLS}
+    ${ONNX_DLLS}
+    ${FMT_RELEASE_DLLS}
+)
 
 # =====================================================================
 # TARGET DEFINITION
@@ -71,6 +100,7 @@ target_link_libraries(inference-gpu
     ${OpenCV_LIBS} 
     debug "${FMT_ROOT}/build/lib/Debug/fmtd.lib"
     optimized "${FMT_ROOT}/build/lib/Release/fmt.lib"
+    CUDA::cudart
 )
 
 # =====================================================================
@@ -101,19 +131,5 @@ add_custom_command(TARGET inference-gpu POST_BUILD
 # =====================================================================
 # INSTALLATION RULES (Exports ONLY the filtered architecture)
 # =====================================================================
-
 install(TARGETS inference-gpu DESTINATION bin)
-
-# ONNX and OpenCV
-install(DIRECTORY "${ONNX_ROOT}/lib/" DESTINATION bin FILES_MATCHING PATTERN "*.dll")
-install(DIRECTORY "${OpenCV_DIR}/x64/vc16/bin/" DESTINATION bin FILES_MATCHING PATTERN "*.dll")
-
-# TensorRT
-install(FILES ${TENSORRT_FILTERED_DLLS} DESTINATION bin)
-
-# Install CUDA Runtime DLLs
-install(DIRECTORY
-    "${CUDA_BIN_PATH}/"
-    DESTINATION bin 
-    FILES_MATCHING PATTERN "*.dll"
-)
+install(FILES ${ALL_RUNTIME_DLLS} DESTINATION bin)
