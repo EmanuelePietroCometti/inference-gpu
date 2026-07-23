@@ -85,7 +85,7 @@ set(ALL_RUNTIME_DLLS
 # TARGET DEFINITION
 # =====================================================================
 
-add_executable(inference-gpu "inference-gpu.cpp" "inference-gpu.h")
+add_executable(inference-gpu "inference-gpu.cpp" )
 
 if (MSVC)
     target_compile_options(inference-gpu PRIVATE /utf-8)
