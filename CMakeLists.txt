@@ -7,6 +7,12 @@ endif()
 
 project ("inference-gpu")
 
+# UNICODE build: TCHAR == wchar_t so the MMF struct layout matches ONNX_inference
+# and the test controller, and Win32 calls resolve to the wide (...W) versions.
+# NOMINMAX: stop <windows.h> from defining min()/max() macros that clobber
+# std::min / std::max (used in ContractMetadata / AsyncBatchDetector / OpenCV).
+add_compile_definitions(UNICODE _UNICODE NOMINMAX)
+
 # =====================================================================
 # TARGET ARCHITECTURE
 # =====================================================================
@@ -14,22 +20,32 @@ set(TENSORRT_TARGET_SM "89" CACHE STRING "Target Compute Capability for TensorRT
 message(STATUS "Installation will target TensorRT SM ${TENSORRT_TARGET_SM}")
 
 # =====================================================================
+# RELATIVE PATHS CONFIGURATION
+# =====================================================================
+# Define a base directory for all SDKs starting from the current folder.
+# By default it expects an "SDK" folder in the same directory as this CMakeLists.txt.
+# It can be overridden via CLI: cmake -DSDK_ROOT="C:/another/path/SDK" ..
+set(SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/SDK" CACHE PATH "Base directory for all SDK dependencies")
+message(STATUS "Using SDK_ROOT: ${SDK_ROOT}")
+
+# =====================================================================
 # PATHS & DEPENDENCIES
 # =====================================================================
 
-set(ONNX_ROOT "D:/emanuele/SDK/onnxruntime-win-x64-gpu-1.24.4")
+set(ONNX_ROOT "${SDK_ROOT}/onnxruntime-win-x64-gpu-1.24.4")
 include_directories("${ONNX_ROOT}/include")
 link_directories("${ONNX_ROOT}/lib")
 
-set(OpenCV_DIR "D:/emanuele/SDK/opencv/build")
+set(OpenCV_DIR "${SDK_ROOT}/opencv/build")
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
-set(FMT_ROOT "D:/emanuele/SDK/fmt-11.1.4")
+set(FMT_ROOT "${SDK_ROOT}/fmt-11.1.4")
 include_directories("${FMT_ROOT}/include")
 
-set(TENSORRT_ROOT "D:/emanuele/SDK/TensorRT-10.16.1.11")
+set(TENSORRT_ROOT "${SDK_ROOT}/TensorRT-10.16.1.11")
 
+# CUDA relies on standard system environment variables, which is already PC-independent
 find_package(CUDAToolkit REQUIRED)
 set(CUDA_BIN_PATH "$ENV{CUDA_PATH}/bin/x64")
 
@@ -85,7 +101,23 @@ set(ALL_RUNTIME_DLLS
 # TARGET DEFINITION
 # =====================================================================
 
-add_executable(inference-gpu "inference-gpu.cpp" )
+# Modular MMF-driven batch provider (replaces the old inference-gpu.cpp monolith,
+# which is kept on disk for reference but no longer compiled).
+set(INFERENCE_GPU_SOURCES
+    "main.cpp"
+    "ManagerGPU.cpp"
+    "WorkerGPU.cpp"
+    "AsyncBatchDetector.cpp"
+    "ContractMetadata.cpp"
+    "OrtSessionConfig.cpp"
+    "RealTimeConfig.cpp"
+    "AsyncLogger.cpp"
+)
+
+add_executable(inference-gpu ${INFERENCE_GPU_SOURCES})
+
+# Select the ONNX Runtime execution-provider stack (TensorRT -> CUDA -> CPU)
+target_compile_definitions(inference-gpu PRIVATE ORT_EP_GPU)
 
 if (MSVC)
     target_compile_options(inference-gpu PRIVATE /utf-8)
@@ -96,12 +128,15 @@ if (CMAKE_VERSION VERSION_GREATER 3.12)
 endif()
 
 target_link_libraries(inference-gpu
-    onnxruntime 
-    ${OpenCV_LIBS} 
+    onnxruntime
+    ${OpenCV_LIBS}
     debug "${FMT_ROOT}/build/lib/Debug/fmtd.lib"
     optimized "${FMT_ROOT}/build/lib/Release/fmt.lib"
     CUDA::cudart
 )
+
+# NOTE: the test controller (inference-gpu-test) has moved to its own repo
+# (inference_gpu_test) together with a byte-identical copy of IPC_Shared.h.
 
 # =====================================================================
 # POST-BUILD COPY COMMANDS

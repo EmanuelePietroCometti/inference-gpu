@@ -371,3 +371,5 @@ tensorrt_cache/
 output/
 *.bmp
 trt_cache/
+SDK/
+docs/
