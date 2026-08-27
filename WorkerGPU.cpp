@@ -129,11 +129,7 @@ void WorkerGPU::InitializeLocalPC()
     // Number of concurrent ORT/TensorRT sessions (GPU streams). Default 2, but
     // overridable at runtime for experiments via the INFGPU_SESSIONS env var
     // (e.g. set INFGPU_SESSIONS=3), clamped to [1, 8]. No rebuild needed.
-    dc.numInfThreads = 2;
-    if (const char* env = std::getenv("INFGPU_SESSIONS")) {
-        int v = std::atoi(env);
-        if (v >= 1 && v <= 8) dc.numInfThreads = v;
-    }
+	dc.numInfThreads = (int)controlPointData->inferenceThreads;
     dc.partition = cpuPartition;
     dc.trtCacheDir = "trt_engine_cache";
 
