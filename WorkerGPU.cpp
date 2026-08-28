@@ -126,6 +126,7 @@ void WorkerGPU::InitializeLocalPC()
     dc.imgH = (int)controlPointData->sizeY;
     dc.channels = (int)(controlPointData->bpp / 8);
     dc.batchSize = (int)controlPointData->batchSize;
+	dc.loopBatch1 = (bool)controlPointData->loopBatch1;
     // Number of concurrent ORT/TensorRT sessions (GPU streams). Default 2, but
     // overridable at runtime for experiments via the INFGPU_SESSIONS env var
     // (e.g. set INFGPU_SESSIONS=3), clamped to [1, 8]. No rebuild needed.

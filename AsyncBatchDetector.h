@@ -52,6 +52,7 @@ struct DetectorConfig {
     int   imgH = 0;            // height of one input image
     int   channels = 3;        // bpp/8 (3 for 24bpp BGR)
     int   batchSize = 17;
+    bool  loopBatch1 = true;
     int   numInfThreads = 2;   // concurrent ORT sessions (decision: keep 2)
     RT::CpuPartition partition;// core slice for OrtSessionConfig
 };
@@ -187,6 +188,9 @@ private:
     int modelC_ = 3, modelH_ = 0, modelW_ = 0;
     int mapH_ = 0, mapW_ = 0;
     size_t inputElems_ = 0, scoreElems_ = 0, mapElems_ = 0;
+    size_t imgElems_ = 0, scoreElems1_ = 0, mapElems1_ = 0;
+	std::vector<int64_t> in1Shape_, sc1Shape_, mp1Shape_;
+
 
     float m_blendAlpha_ = 0.5f;
 };

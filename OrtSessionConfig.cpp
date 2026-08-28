@@ -118,15 +118,18 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
 
         const char* keys[] = {
             "device_id",
-            "trt_fp16_enable",                // FP16 kernels: big speedup on modern GPUs
-            "trt_engine_cache_enable",        // reuse the serialized engine across process runs
+            "trt_fp16_enable",                      // FP16 kernels: big speedup on modern GPUs
+            "trt_engine_cache_enable",              // reuse the serialized engine across process runs
             "trt_engine_cache_path",
-            "trt_timing_cache_enable",        // reuse kernel-timing results: much faster (re)builds
+            "trt_timing_cache_enable",              // reuse kernel-timing results: much faster (re)builds
             "trt_timing_cache_path",
-            "trt_builder_optimization_level"  // 5 = most aggressive builder search (slower build, faster engine)
+            "trt_builder_optimization_level",       // 5 = most aggressive builder search (slower build, faster engine)
+			"trt_max_workspace_size",         
+			"trt_detailed_build_log",               // 1 = verbose builder log (useful for debugging)
+			"trt_dump_subgraphs",                   // 1 = dump the subgraph ONNX to disk (useful for debugging)
         };
         const char* values[] = {
-            "0", "1", "1", engineCache.c_str(), "1", timingCache.c_str(), "5"
+			"0", "1", "1", engineCache.c_str(), "1", timingCache.c_str(), "5", "12884901888", "0", "0"
         };
         Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(
             trt, keys, values, sizeof(keys) / sizeof(keys[0])));

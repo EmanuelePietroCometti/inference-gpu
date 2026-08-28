@@ -126,6 +126,13 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
         mapW_ = (int)mapShape[mapShape.size() - 1];
     }
 
+    imgElems_ = inputElems_ / B;
+    scoreElems1_ = scoreElems_ / B;
+    mapElems1_ = mapElems_ ? mapElems_ / B : 0;
+    in1Shape_ = inShape;    in1Shape_[0] = 1;
+    sc1Shape_ = scoreShape; sc1Shape_[0] = 1;
+    mp1Shape_ = mapShape;   if (!mp1Shape_.empty()) mp1Shape_[0] = 1;
+
     // ---- antialiased resize coefficients (input image size -> model size) ----
     resizeCoeffs_.Build(cfg_.imgW, cfg_.imgH, modelW_, modelH_);
 
@@ -149,13 +156,23 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
             if (cudaMalloc(&ctx.d_score, scoreElems_ * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc score");
             if (mapIdx_ >= 0 && cudaMalloc(&ctx.d_map, mapElems_ * sizeof(float)) != cudaSuccess) throw std::runtime_error("cudaMalloc map");
 
+            const bool loop1 = cfg_.loopBatch1;
             Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
-            ctx.inT = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_input, inputElems_, inShape.data(), inShape.size());
+            ctx.inT = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_input,
+                loop1 ? imgElems_ : inputElems_,
+                loop1 ? in1Shape_.data() : inShape.data(),
+                loop1 ? in1Shape_.size() : inShape.size());
             ctx.binding->BindInput(inputName_.c_str(), ctx.inT);
-            ctx.scoreT = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_score, scoreElems_, scoreShape.data(), scoreShape.size());
+            ctx.scoreT = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_score,
+                loop1 ? scoreElems1_ : scoreElems_,
+                loop1 ? sc1Shape_.data() : scoreShape.data(),
+                loop1 ? sc1Shape_.size() : scoreShape.size());
             ctx.binding->BindOutput(scoreName_.c_str(), ctx.scoreT);
             if (mapIdx_ >= 0) {
-                ctx.mapT = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_map, mapElems_, mapShape.data(), mapShape.size());
+                ctx.mapT = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_map,
+                    loop1 ? mapElems1_ : mapElems_,
+                    loop1 ? mp1Shape_.data() : mapShape.data(),
+                    loop1 ? mp1Shape_.size() : mapShape.size());
                 ctx.binding->BindOutput(mapName_.c_str(), ctx.mapT);
             }
             Log::Info("[Session {}] GPU IoBinding: input {} f32, score {} f32, map {} f32 (VRAM).", i, inputElems_, scoreElems_, mapElems_);
@@ -307,7 +324,27 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
                 // before returning — same proven pattern as AnomalyEngine.
                 cudaMemcpy(ctx.d_input, batch->pinned_blob.get(), inputElems_ * sizeof(float), cudaMemcpyHostToDevice);
                 batch->pinned_blob.reset(); // done with the staging buffer -> back to the pool
-                ctx.session->Run(ro, *ctx.binding);
+                if (cfg_.loopBatch1) {
+                    Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+                    for (int i = 0; i < B; ++i) {
+                        auto in1 = Ort::Value::CreateTensor<float>(cudaMem,
+                            ctx.d_input + (size_t)i * imgElems_, imgElems_, in1Shape_.data(), in1Shape_.size());
+                        ctx.binding->BindInput(inputName_.c_str(), in1);
+                        auto sc1 = Ort::Value::CreateTensor<float>(cudaMem,
+                            +ctx.d_score + (size_t)i * scoreElems1_, scoreElems1_, sc1Shape_.data(), sc1Shape_.size());
+                        ctx.binding->BindOutput(scoreName_.c_str(), sc1);
+                        if (mapIdx_ >= 0) {
+                            auto mp1 = Ort::Value::CreateTensor<float>(cudaMem,
+                                ctx.d_map + (size_t)i * mapElems1_, mapElems1_, mp1Shape_.data(), mp1Shape_.size());
+                            ctx.binding->BindOutput(mapName_.c_str(), mp1);
+                        }
+                        ctx.session->Run(ro, *ctx.binding);
+                        
+                    }
+                }
+                else {
+                    ctx.session->Run(ro, *ctx.binding);
+                }
                 cudaMemcpy(ctx.h_score.data(), ctx.d_score, scoreElems_ * sizeof(float), cudaMemcpyDeviceToHost);
                 if (mapIdx_ >= 0)
                     cudaMemcpy(ctx.h_map.data(), ctx.d_map, mapElems_ * sizeof(float), cudaMemcpyDeviceToHost);
