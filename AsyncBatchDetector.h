@@ -140,6 +140,8 @@ private:
         std::unique_ptr<Ort::Session>   session;
         std::unique_ptr<Ort::IoBinding> binding;
         bool  gpu = false;
+
+		cudaStream_t stream = nullptr;
         // Device (VRAM) buffers for zero-copy tensors
         float* d_input = nullptr;
         float* d_score = nullptr;

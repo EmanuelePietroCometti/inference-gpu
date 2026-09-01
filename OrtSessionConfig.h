@@ -9,4 +9,4 @@
 // pinned inside it. An empty partition falls back to the whole-machine pool
 // (single-session behavior).
 bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
-    const RT::CpuPartition& cpuPartition);
+    const RT::CpuPartition& cpuPartition, void* userComputeStream = nullptr);

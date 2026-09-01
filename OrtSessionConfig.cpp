@@ -72,7 +72,7 @@ void OrtRtJoinThread(OrtCustomThreadHandle handle)
 // 'tag' is only used to prefix log lines (e.g. "Anomaly", "Classification").
 // 'cpuPartition' is the core slice owned by this session; empty = whole machine.
 bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
-    const RT::CpuPartition& cpuPartition)
+    const RT::CpuPartition& cpuPartition, void* userComputeStream)
 {
     bool hardwareAccelerated = false;
 
@@ -129,10 +129,19 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
 			"trt_dump_subgraphs",                   // 1 = dump the subgraph ONNX to disk (useful for debugging)
         };
         const char* values[] = {
-			"0", "1", "1", engineCache.c_str(), "1", timingCache.c_str(), "5", "12884901888", "0", "0"
+			"0", "1", "1", engineCache.c_str(), "1", timingCache.c_str(), "5", "4294967296", "0", "0"
         };
         Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(
             trt, keys, values, sizeof(keys) / sizeof(keys[0])));
+
+        if (userComputeStream) {
+            const char* sk[] = { "has_user_compute_stream" };
+			const char* sv[] = { "1" };
+            Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(
+                trt, sk, sv, 1));
+            Ort::ThrowOnError(api.UpdateTensorRTProviderOptionsWithValue(
+                trt, "user_compute_stream", userComputeStream));
+        }
 
         so.AppendExecutionProvider_TensorRT_V2(*trt);
         hardwareAccelerated = true;
@@ -155,6 +164,14 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
         const char* values[] = { "0", "1" };  // let cuDNN pick the fastest conv algo
         Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
             cuda, keys, values, sizeof(keys) / sizeof(keys[0])));
+        if (userComputeStream) {
+            const char* sk[] = { "has_user_compute_stream" };
+            const char* sv[] = { "1" };
+            Ort::ThrowOnError(api.UpdateCUDAProviderOptions(
+                cuda, sk, sv, 1));
+            Ort::ThrowOnError(api.UpdateCUDAProviderOptionsWithValue(
+                cuda, "user_compute_stream", userComputeStream));
+        }
 
         so.AppendExecutionProvider_CUDA_V2(*cuda);
         hardwareAccelerated = true;

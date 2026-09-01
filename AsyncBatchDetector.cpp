@@ -71,8 +71,10 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
     // ---- create the ORT sessions (one per inference thread) ----
     sessions_.resize(cfg_.numInfThreads);
     for (int i = 0; i < cfg_.numInfThreads; ++i) {
+        if(cudaStreamCreateWithFlags(&sessions_[i].stream, cudaStreamNonBlocking) != cudaSuccess)
+			throw std::runtime_error("cudaStreamCreate failed");
         Ort::SessionOptions options;
-        sessions_[i].gpu = ConfigureOrtSessionOptions(options, "Anomaly", cfg_.partition);
+		sessions_[i].gpu = ConfigureOrtSessionOptions(options, "Anomaly", cfg_.partition, sessions_[i].stream);
         sessions_[i].session = std::make_unique<Ort::Session>(env_, cfg_.modelPath.c_str(), options);
     }
     Ort::Session& s0 = *sessions_[0].session;
@@ -220,9 +222,12 @@ AsyncBatchDetector::~AsyncBatchDetector()
     for (auto& t : pool_post_) if (t.joinable()) t.join();
 
     for (auto& ctx : sessions_) {
+		ctx.binding.reset();
+		ctx.session.reset();
         if (ctx.d_input) cudaFree(ctx.d_input);
         if (ctx.d_score) cudaFree(ctx.d_score);
         if (ctx.d_map)   cudaFree(ctx.d_map);
+		if (ctx.stream) cudaStreamDestroy(ctx.stream);
     }
 }
 
@@ -322,7 +327,7 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
                 // Ordering is guaranteed: synchronous cudaMemcpy blocks the host
                 // until the copy completes, and ORT::Run synchronizes its stream
                 // before returning — same proven pattern as AnomalyEngine.
-                cudaMemcpy(ctx.d_input, batch->pinned_blob.get(), inputElems_ * sizeof(float), cudaMemcpyHostToDevice);
+                cudaMemcpyAsync(ctx.d_input, batch->pinned_blob.get(), inputElems_ * sizeof(float), cudaMemcpyHostToDevice, ctx.stream);
                 batch->pinned_blob.reset(); // done with the staging buffer -> back to the pool
                 if (cfg_.loopBatch1) {
                     Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
@@ -345,9 +350,10 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
                 else {
                     ctx.session->Run(ro, *ctx.binding);
                 }
-                cudaMemcpy(ctx.h_score.data(), ctx.d_score, scoreElems_ * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpyAsync(ctx.h_score.data(), ctx.d_score, scoreElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
                 if (mapIdx_ >= 0)
-                    cudaMemcpy(ctx.h_map.data(), ctx.d_map, mapElems_ * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaMemcpyAsync(ctx.h_map.data(), ctx.d_map, mapElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
+				cudaStreamSynchronize(ctx.stream);
             }
             else {
                 std::memcpy(ctx.h_input.data(), batch->pinned_blob.get(), inputElems_ * sizeof(float));
