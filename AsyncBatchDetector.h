@@ -147,7 +147,9 @@ private:
         float* d_score = nullptr;
         float* d_map = nullptr;
         // Host landing buffers (D2H targets, or the bound tensors on CPU fallback)
-        std::vector<float> h_input, h_score, h_map;
+        std::vector<float> h_input;   // CPU-EP input staging only (no stream, no async)
+        float* h_score = nullptr;     // pinned host: D2H landing + CPU-EP output tensor
+        float* h_map = nullptr;
         Ort::Value inT{ nullptr }, scoreT{ nullptr }, mapT{ nullptr };
     };
 
