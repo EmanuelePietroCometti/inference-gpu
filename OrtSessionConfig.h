@@ -2,11 +2,15 @@
 #include <onnxruntime_cxx_api.h>
 #include <string>
 #include "RealTimeConfig.h"
+#include "AsyncBatchDetector.h"
 
-// Configures execution providers + session options for one session.
-// cpuPartition is the core slice owned by the session (see RealTimeConfig.h):
-// on the CPU path the intra-op pool is sized on the slice and its threads are
-// pinned inside it. An empty partition falls back to the whole-machine pool
-// (single-session behavior).
-bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
+namespace ep {
+    inline constexpr const char* kNvRtxName = "NvTensorRTRTXExecutionProvider";
+    inline constexpr const ORTCHAR_T* kNvRtxLib = ORT_TSTR("onnxruntime_providers_nv_tensorrt_rtx.dll");
+}
+
+// true if INFGPU_BACKEND=rtx (default false = classic TensorRT).
+bool UseTensorRtRtxBackend();
+
+bool ConfigureOrtSessionOptions(Ort::Env& env, Ort::SessionOptions& so,  DetectorConfig cfg_,
     const RT::CpuPartition& cpuPartition, void* userComputeStream = nullptr);

@@ -32,7 +32,7 @@ message(STATUS "Using SDK_ROOT: ${SDK_ROOT}")
 # PATHS & DEPENDENCIES
 # =====================================================================
 
-set(ONNX_ROOT "${SDK_ROOT}/onnxruntime-win-x64-gpu-1.24.4")
+set(ONNX_ROOT "${SDK_ROOT}/onnxruntime-win-x64-gpu_cuda13-1.29.0")
 include_directories("${ONNX_ROOT}/include")
 link_directories("${ONNX_ROOT}/lib")
 
@@ -44,6 +44,9 @@ set(FMT_ROOT "${SDK_ROOT}/fmt-11.1.4")
 include_directories("${FMT_ROOT}/include")
 
 set(TENSORRT_ROOT "${SDK_ROOT}/TensorRT-10.16.1.11")
+
+set(TENSORRT_RTX_ROOT "${SDK_ROOT}/TensorRT-RTX-1.5.0.114")
+set(NV_RTX_EP_ROOT "${SDK_ROOT}/TensorRT-RTX-EP-ABI-v0.3.0-cu13")
 
 # CUDA relies on standard system environment variables, which is already PC-independent
 find_package(CUDAToolkit REQUIRED)
@@ -88,14 +91,8 @@ file(GLOB CUDA_ESSENTIAL_DLLS
 
 file(GLOB ONNX_DLLS "${ONNX_ROOT}/lib/*.dll")
 file(GLOB FMT_RELEASE_DLLS "${FMT_ROOT}/build/bin/Release/fmt*.dll")
+file(GLOB TENSORRT_RTX_DLLS "${TENSORRT_RTX_ROOT}/bin/*.dll")
 
-set(ALL_RUNTIME_DLLS 
-    ${TENSORRT_FILTERED_DLLS}
-    ${OPENCV_RELEASE_DLLS}
-    ${CUDA_ESSENTIAL_DLLS}
-    ${ONNX_DLLS}
-    ${FMT_RELEASE_DLLS}
-)
 
 # =====================================================================
 # TARGET DEFINITION
@@ -116,7 +113,7 @@ set(INFERENCE_GPU_SOURCES
 
 add_executable(inference-gpu ${INFERENCE_GPU_SOURCES})
 
-# Select the ONNX Runtime execution-provider stack (TensorRT -> CUDA -> CPU)
+# Select the ONNX Runtime execution-provider stack (ORT_EP_GPU, ORT_EP_OPENVINO or ORT_EP_cpu)
 target_compile_definitions(inference-gpu PRIVATE ORT_EP_GPU)
 
 if (MSVC)
@@ -156,12 +153,74 @@ add_custom_command(TARGET inference-gpu POST_BUILD
     COMMENT "Copying OpenCV DLLs to output directory..."
 )
 
-add_custom_command(TARGET inference-gpu POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    "${TENSORRT_ROOT}/bin" 
-    "$<TARGET_FILE_DIR:inference-gpu>"
-    COMMENT "Copying ALL TensorRT DLLs to output directory..."
-)
+# =====================================================================
+# DYNAMIC POST-BUILD & INSTALL RULES based on target definition
+# =====================================================================
+# Use a CMake variable to control the logic flow
+set(USE_TENSORRT_RTX OFF) # Set to OFF to use standard TensorRT
+
+if(USE_TENSORRT_RTX)
+
+    # Set TENSORRT_NORMAL or TENSORRT_RTX for conditional compilation in the code
+    target_compile_definitions(inference-gpu PRIVATE TENSORRT_RTX)
+    
+    # Copy ONLY TensorRT-RTX and its specific EP plugin
+    add_custom_command(TARGET inference-gpu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${TENSORRT_RTX_ROOT}/bin"
+        "$<TARGET_FILE_DIR:inference-gpu>"
+        COMMENT "Copying TensorRT-RTX DLLs to output directory..."
+    )
+    add_custom_command(TARGET inference-gpu POST_BUILD
+         COMMAND ${CMAKE_COMMAND} -E copy_directory
+         "${TENSORRT_RTX_ROOT}/lib"
+         "$<TARGET_FILE_DIR:inference-gpu>"
+         COMMENT "Copying TensorRT-RTX lib DLLs (tensorrt_plugins.dll etc.)..."
+    )
+    add_custom_command(TARGET inference-gpu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${TENSORRT_RTX_ROOT}/bin"
+        "$<TARGET_FILE_DIR:inference-gpu>"
+        COMMENT "Copying TensorRT-RTX DLLs to output directory..."
+    )
+    add_custom_command(TARGET inference-gpu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${NV_RTX_EP_ROOT}"
+        "$<TARGET_FILE_DIR:inference-gpu>"
+        COMMENT "Copying TensorRT-RTX EP plugin to output directory..."
+    )
+
+    file(GLOB NV_RTX_EP_FILES "${NV_RTX_EP_ROOT}/*.dll")
+    
+    # Overwrite ALL_RUNTIME_DLLS to exclude standard TRT
+    set(ALL_RUNTIME_DLLS 
+        ${TENSORRT_RTX_DLLS}
+        ${NV_RTX_EP_FILES}
+        ${OPENCV_RELEASE_DLLS}
+        ${CUDA_ESSENTIAL_DLLS}
+        ${ONNX_DLLS}
+        ${FMT_RELEASE_DLLS}
+    )
+else()
+    target_compile_definitions(inference-gpu PRIVATE TENSORRT_NORMAL)
+    
+    # Copy ONLY standard TensorRT
+    add_custom_command(TARGET inference-gpu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${TENSORRT_ROOT}/bin" 
+        "$<TARGET_FILE_DIR:inference-gpu>"
+        COMMENT "Copying standard TensorRT DLLs to output directory..."
+    )
+    
+    # Overwrite ALL_RUNTIME_DLLS to exclude RTX TRT
+    set(ALL_RUNTIME_DLLS 
+        ${TENSORRT_FILTERED_DLLS}
+        ${OPENCV_RELEASE_DLLS}
+        ${CUDA_ESSENTIAL_DLLS}
+        ${ONNX_DLLS}
+        ${FMT_RELEASE_DLLS}
+    )
+endif()
 
 # =====================================================================
 # INSTALLATION RULES (Exports ONLY the filtered architecture)

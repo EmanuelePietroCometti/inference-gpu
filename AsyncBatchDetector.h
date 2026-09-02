@@ -47,7 +47,9 @@ using ResultCallback = std::function<void(BatchOutput&&)>;
 
 struct DetectorConfig {
     std::wstring modelPath;
-    std::string  trtCacheDir = "trt_engine_cache";
+    std::string  trtEngineCacheDir = "trt_engine_cache";
+	std::string  trtTimingCacheDir = "trt_timing_cache";
+	std::string  tag = "AnomalyDetector";
     int   imgW = 0;            // width  of one input image (== model image width)
     int   imgH = 0;            // height of one input image
     int   channels = 3;        // bpp/8 (3 for 24bpp BGR)
@@ -142,6 +144,7 @@ private:
         bool  gpu = false;
 
 		cudaStream_t stream = nullptr;
+        cudaEvent_t evStart = nullptr, evAfterH2D = nullptr, evAfterRun = nullptr, evAfterD2H = nullptr;
         // Device (VRAM) buffers for zero-copy tensors
         float* d_input = nullptr;
         float* d_score = nullptr;
@@ -156,7 +159,6 @@ private:
     void preprocessingWorker();
     void inferenceWorker(int session_index);
     void postprocessingWorker();
-    void buildSession(int index);
 
     DetectorConfig cfg_;
     ResultCallback sink_;

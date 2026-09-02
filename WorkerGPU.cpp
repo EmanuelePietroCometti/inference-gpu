@@ -132,7 +132,9 @@ void WorkerGPU::InitializeLocalPC()
     // (e.g. set INFGPU_SESSIONS=3), clamped to [1, 8]. No rebuild needed.
 	dc.numInfThreads = (int)controlPointData->inferenceThreads;
     dc.partition = cpuPartition;
-    dc.trtCacheDir = "trt_engine_cache";
+    dc.trtEngineCacheDir = "trt_engine_cache";
+	dc.trtTimingCacheDir = "trt_timing_cache";
+	dc.tag = "AnomalyDetector";
 
     metrics_.batch_size = dc.batchSize;
     detector_ = std::make_unique<AsyncBatchDetector>(

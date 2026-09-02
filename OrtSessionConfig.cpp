@@ -7,6 +7,12 @@
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
+#include <vector>
+#include <string>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <stdexcept>
 
 //
 // OrtSessionConfig.h
@@ -71,7 +77,7 @@ void OrtRtJoinThread(OrtCustomThreadHandle handle)
 // appended, false if the run will happen on the built-in CPU EP.
 // 'tag' is only used to prefix log lines (e.g. "Anomaly", "Classification").
 // 'cpuPartition' is the core slice owned by this session; empty = whole machine.
-bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
+bool ConfigureOrtSessionOptions(Ort::Env& env, Ort::SessionOptions& so, DetectorConfig cfg_,
     const RT::CpuPartition& cpuPartition, void* userComputeStream)
 {
     bool hardwareAccelerated = false;
@@ -92,64 +98,119 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
     }
 
 #if defined(ORT_EP_GPU)
-    // GPU build: TensorRT -> CUDA -> CPU
-    // ORT graph fusions still run before the EP partitions the graph, so keep
-    // them enabled; TensorRT/CUDA then take the fused subgraphs.
+    // GPU family: classic TensorRT | TensorRT-RTX -> CUDA -> CPU. Runtime selection.
     so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+    so.AddConfigEntry("session.free_dimension_override.batch", "17");
 
     const OrtApi& api = Ort::GetApi();
 
-    // Absolute cache paths. Relative paths ("./trt_cache") break the moment the
-    // working directory differs from the exe directory (service, launcher, or a
-    // caller that changed CWD), silently disabling the cache.
-    static const std::string engineCache =
-        std::filesystem::absolute("trt_engine_cache").string();
-    static const std::string timingCache =
-        std::filesystem::absolute("trt_timing_cache").string();
-
-    // TensorRT
-    try {
-        OrtTensorRTProviderOptionsV2* trt = nullptr;
-        Ort::ThrowOnError(api.CreateTensorRTProviderOptions(&trt));
-        std::unique_ptr<OrtTensorRTProviderOptionsV2, void (*)(OrtTensorRTProviderOptionsV2*)>
-            trtGuard(trt, [](OrtTensorRTProviderOptionsV2* p) {
-            Ort::GetApi().ReleaseTensorRTProviderOptions(p);
-                });
-
-        const char* keys[] = {
-            "device_id",
-            "trt_fp16_enable",                      // FP16 kernels: big speedup on modern GPUs
-            "trt_engine_cache_enable",              // reuse the serialized engine across process runs
-            "trt_engine_cache_path",
-            "trt_timing_cache_enable",              // reuse kernel-timing results: much faster (re)builds
-            "trt_timing_cache_path",
-            "trt_builder_optimization_level",       // 5 = most aggressive builder search (slower build, faster engine)
-			"trt_max_workspace_size",         
-			"trt_detailed_build_log",               // 1 = verbose builder log (useful for debugging)
-			"trt_dump_subgraphs",                   // 1 = dump the subgraph ONNX to disk (useful for debugging)
-        };
-        const char* values[] = {
-			"0", "1", "1", engineCache.c_str(), "1", timingCache.c_str(), "5", "4294967296", "0", "0"
-        };
-        Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(
-            trt, keys, values, sizeof(keys) / sizeof(keys[0])));
-
-        if (userComputeStream) {
-            const char* sk[] = { "has_user_compute_stream" };
-			const char* sv[] = { "1" };
+#if defined(TENSORRT_NORMAL)
+        static const std::string engineCache = std::filesystem::absolute(cfg_.trtEngineCacheDir).string();
+        static const std::string timingCache = std::filesystem::absolute(cfg_.trtTimingCacheDir).string();
+        try {
+            OrtTensorRTProviderOptionsV2* trt = nullptr;
+            Ort::ThrowOnError(api.CreateTensorRTProviderOptions(&trt));
+            std::unique_ptr<OrtTensorRTProviderOptionsV2, void (*)(OrtTensorRTProviderOptionsV2*)>
+                trtGuard(trt, [](OrtTensorRTProviderOptionsV2* p) {
+                Ort::GetApi().ReleaseTensorRTProviderOptions(p);
+                    });
+            const char* keys[] = {
+                "device_id", 
+                "trt_fp16_enable",
+                "trt_engine_cache_enable", 
+                "trt_engine_cache_path",
+                "trt_timing_cache_enable", 
+                "trt_timing_cache_path",
+                "trt_builder_optimization_level", 
+                "trt_max_workspace_size",
+                "trt_detailed_build_log", 
+                "trt_dump_subgraphs",
+                "trt_build_heuristics_enable",
+                "trt_engine_hw_compatible",
+                "trt_context_memory_sharing_enable",
+                "trt_cuda_graph_enable"
+            };
+            const char* values[] = {
+                "0", 
+                "1", 
+                "1", 
+                engineCache.c_str(), 
+                "1", 
+                timingCache.c_str(),
+                "3", 
+                "2147483648", 
+                "0", 
+                "0",
+                "1",
+                "0",
+                "1",
+                "0"
+            };
             Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(
-                trt, sk, sv, 1));
-            Ort::ThrowOnError(api.UpdateTensorRTProviderOptionsWithValue(
-                trt, "user_compute_stream", userComputeStream));
+                trt, keys, values, sizeof(keys) / sizeof(keys[0])));
+            OrtAllocator* alloc = nullptr;
+            Ort::ThrowOnError(api.GetAllocatorWithDefaultOptions(&alloc));
+            char* dump = nullptr;
+            Ort::ThrowOnError(api.GetTensorRTProviderOptionsAsString(trt, alloc, &dump));
+            const std::string opts(dump);
+            Log::Info("[{}] TRT options effettive ({} char):", cfg_.tag, opts.size());
+            for (size_t i = 0; i < opts.size(); i += 200)
+                Log::Info("  {}", opts.substr(i, 200));
+            alloc->Free(alloc, dump);
+            if (userComputeStream) {
+                const char* sk[] = { "has_user_compute_stream" };
+                const char* sv[] = { "1" };
+                Ort::ThrowOnError(api.UpdateTensorRTProviderOptions(trt, sk, sv, 1));
+                Ort::ThrowOnError(api.UpdateTensorRTProviderOptionsWithValue(
+                    trt, "user_compute_stream", userComputeStream));
+            }
+            so.AppendExecutionProvider_TensorRT_V2(*trt);
+            hardwareAccelerated = true;
+            Log::Info("[{}] TensorRT EP appended (FP16 + engine/timing cache).", cfg_.tag);
         }
+        catch (const Ort::Exception& e) {
+            Log::Warning("[{}] TensorRT unavailable, trying CUDA: {}", cfg_.tag, e.what());
+        }
+#else
+        try {
+            static const std::string nvCache =
+                std::filesystem::absolute("nv_runtime_cache").string();
 
-        so.AppendExecutionProvider_TensorRT_V2(*trt);
-        hardwareAccelerated = true;
-        Log::Info("[{}] TensorRT EP appended (FP16 + engine/timing cache).", tag);
+            std::vector<std::string> okeys = {
+                "device_id", "enable_cuda_graph", "nv_runtime_cache_path", "nv_detailed_build_log"
+            };
+            std::vector<std::string> ovals = {
+                "0", "0" /* loopBatch1 rebinds at every Run -> CUDA graph OFF */, nvCache, "0"
+            };
+            if (userComputeStream) {
+                char b[32];
+                snprintf(b, sizeof(b), "%llu", (unsigned long long)(uintptr_t)userComputeStream);
+                okeys.push_back("user_compute_stream"); ovals.push_back(b);
+            }
+
+            // The plugin is registered on the Env (see AsyncBatchDetector); find the device.
+            const OrtEpDevice* const* devs = nullptr; size_t n = 0;
+            Ort::ThrowOnError(api.GetEpDevices(env, &devs, &n));
+            const OrtEpDevice* rtx = nullptr;
+            for (size_t i = 0; i < n; ++i)
+                if (std::strcmp(api.EpDevice_EpName(devs[i]), ep::kNvRtxName) == 0) { rtx = devs[i]; break; }
+            if (!rtx) throw std::runtime_error("NvTensorRTRTX device not found (plugin not registered?)");
+
+            std::vector<const char*> ck, cvv;
+            for (auto& s : okeys) ck.push_back(s.c_str());
+            for (auto& s : ovals) cvv.push_back(s.c_str());
+            Ort::ThrowOnError(api.SessionOptionsAppendExecutionProvider_V2(
+                so, env, &rtx, 1, ck.data(), cvv.data(), ck.size()));
+
+            hardwareAccelerated = true;
+            Log::Info("[{}] TensorRT-RTX EP appended (JIT + runtime cache).", tag);
+        }
+        catch (const std::exception& e) {
+            Log::Warning("[{}] TensorRT-RTX unavailable, trying CUDA: {}", tag, e.what());
+
     }
-    catch (const Ort::Exception& e) {
-        Log::Warning("[{}] TensorRT unavailable, trying CUDA: {}", tag, e.what());
-    }
+#endif
 
     // CUDA fallback (also covers subgraphs TensorRT cannot handle)
     try {
@@ -175,10 +236,10 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
 
         so.AppendExecutionProvider_CUDA_V2(*cuda);
         hardwareAccelerated = true;
-        Log::Info("[{}] CUDA EP appended.", tag);
+        Log::Info("[{}] CUDA EP appended.", cfg_.tag);
     }
     catch (const Ort::Exception& e) {
-        Log::Warning("[{}] CUDA unavailable, falling back to CPU: {}", tag, e.what());
+        Log::Warning("[{}] CUDA unavailable, falling back to CPU: {}", cfg_.tag, e.what());
     }
 
 #elif defined(ORT_EP_OPENVINO)
@@ -272,7 +333,7 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
                 affinity += std::to_string(cpuPartition.logicalProcessors[t] + 1);
             }
             so.AddConfigEntry(kOrtSessionOptionsConfigIntraOpThreadAffinities, affinity.c_str());
-            Log::Info("[{}] Intra-op pool pinned inside the slice (1-based ids: '{}')", tag, affinity);
+            Log::Info("[{}] Intra-op pool pinned inside the slice (1-based ids: '{}')", cfg_.tag, affinity);
         }
 
         // Spinning policy: on a DEDICATED slice, busy-waiting between ops burns
@@ -289,7 +350,7 @@ bool ConfigureOrtSessionOptions(Ort::SessionOptions& so, const std::string& tag,
         so.SetCustomCreateThreadFn(OrtRtCreateThread);
         so.SetCustomJoinThreadFn(OrtRtJoinThread);
         Log::Info("[{}] Intra-op pool: {} TIME_CRITICAL threads, spinning {}.",
-            tag, sliceThreads, dedicatedSlice ? "ON" : "OFF");
+            cfg_.tag, sliceThreads, dedicatedSlice ? "ON" : "OFF");
     }
 
     return hardwareAccelerated;
