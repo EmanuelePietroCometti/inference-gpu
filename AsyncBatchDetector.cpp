@@ -358,7 +358,7 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
                             ctx.d_input + (size_t)i * imgElems_, imgElems_, in1Shape_.data(), in1Shape_.size());
                         ctx.binding->BindInput(inputName_.c_str(), in1);
                         auto sc1 = Ort::Value::CreateTensor<float>(cudaMem,
-                            +ctx.d_score + (size_t)i * scoreElems1_, scoreElems1_, sc1Shape_.data(), sc1Shape_.size());
+                            ctx.d_score + (size_t)i * scoreElems1_, scoreElems1_, sc1Shape_.data(), sc1Shape_.size());
                         ctx.binding->BindOutput(scoreName_.c_str(), sc1);
                         if (mapIdx_ >= 0) {
                             auto mp1 = Ort::Value::CreateTensor<float>(cudaMem,
