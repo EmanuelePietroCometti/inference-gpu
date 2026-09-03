@@ -43,15 +43,15 @@ struct PerformanceMetrics {
             return sum / n;
         };
 
-        double avg_prep  = calc_last_n_avg(preprocessing_times, window) / batch_size;
-        double avg_batch = calc_last_n_avg(batch_prep_times, window) / batch_size;
-        double avg_gpu   = calc_last_n_avg(gpu_times, window) / batch_size;
-        double avg_h2d = calc_last_n_avg(h2d_times, window) / batch_size;
-        double avg_run = calc_last_n_avg(run_times, window) / batch_size;
-        double avg_d2h = calc_last_n_avg(d2h_times, window) / batch_size;
-        double avg_post  = calc_last_n_avg(postprocessing_times, window) / batch_size;
+        double avg_prep  = calc_last_n_avg(preprocessing_times, window);
+        double avg_batch = calc_last_n_avg(batch_prep_times, window);
+        double avg_gpu   = calc_last_n_avg(gpu_times, window);
+        double avg_h2d = calc_last_n_avg(h2d_times, window);
+        double avg_run = calc_last_n_avg(run_times, window);
+        double avg_d2h = calc_last_n_avg(d2h_times, window);
+        double avg_post  = calc_last_n_avg(postprocessing_times, window);
 
-        fmt::print("[MONITOR] Batch {}-{} | per-patch(ms) CPU:{:.2f} DMA:{:.2f} | GPUwall:{:.2f} = H2D:{:.3f}+Run:{:.3f}+D2H:{:.3f} | Out:{:.2f}\n",
+        fmt::print("[MONITOR] Batch {}-{} | per-batch(ms) CPU:{:.2f} DMA:{:.2f} | GPUwall:{:.2f} = H2D:{:.3f}+Run:{:.3f}+D2H:{:.3f} | Out:{:.2f}\n",
             p_size - window + 1, p_size, avg_prep, avg_batch, avg_gpu, avg_h2d, avg_run, avg_d2h, avg_post);
     }
 

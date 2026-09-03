@@ -7,9 +7,12 @@
 #include "ManagerGPU.h"
 #include "AsyncLogger.h"
 #include "RealTimeConfig.h"
+#include "stdlib.h"
 
 int main()
 {
+	// Disable lazy loading of CUDA modules to guarantee that the first inference call is not delayed by a lazy load.
+	_putenv_s("CUDA_MODULE_LOADING", "EAGER"); 
     AsyncLogger::Instance().Start();
 
     RT::EnableRealTimeProcess();

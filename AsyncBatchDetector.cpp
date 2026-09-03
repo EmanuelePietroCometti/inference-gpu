@@ -61,7 +61,7 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
     : cfg_(cfg), sink_(std::move(sink)), metrics_(metrics)
 {
     metrics_.batch_size = cfg_.batchSize;
-    cv::setNumThreads((std::max)(1, cv::getNumberOfCPUs() / 2));
+    cv::setNumThreads((std::max)(1, cv::getNumberOfCPUs()));
     cudaSetDevice(0);
 
 #ifdef TENSORRT_RTX
@@ -159,6 +159,9 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
         if (cudaMallocHost((void**)&ctx.h_map, mapAlloc * sizeof(float)) != cudaSuccess)
             throw std::runtime_error("cudaMallocHost h_map failed");
         std::memset(ctx.h_map, 0, mapAlloc * sizeof(float));
+        if(cudaMallocHost((void**)&ctx.h_warm, inputElems_ * sizeof(float)) != cudaSuccess)
+			throw std::runtime_error("cudaMallocHost h_warm failed");
+		std::memset(ctx.h_warm, 0, inputElems_ * sizeof(float));
         ctx.binding = std::make_unique<Ort::IoBinding>(*ctx.session);
 
         if (ctx.gpu) {
@@ -206,10 +209,24 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
         }
 
         // Warmup: builds/loads the TensorRT engine (cached) and locks kernels.
-        if (ctx.gpu) cudaMemset(ctx.d_input, 0, inputElems_ * sizeof(float));
-        Ort::RunOptions ro{ nullptr };
-        for (int r = 0; r < 10; ++r) ctx.session->Run(ro, *ctx.binding);
-        Log::Info("[Session {}] warmup complete.", i);
+        if (ctx.gpu) {
+            cudaMemset(ctx.d_input, 0, inputElems_ * sizeof(float));
+        }
+        float* warm = pinnedPool_.acquire();
+        if (warm) {
+			std::memset(warm, 0, inputElems_ * sizeof(float));
+            for (int r = 0; r < 10; r++) {
+				submitBatch(ctx, warm, false);
+            }
+			pinnedPool_.release(warm);
+        }
+        else {
+            Ort::RunOptions ro{ nullptr };
+            for (int r = 0; r < 10; r++) {
+                ctx.session->Run(ro, *ctx.binding);
+			}
+        }
+		Log::Info("[Session {}] Warmup done ({} runs).", i, 10);
     }
 
     // ---- launch the pipeline ----
@@ -241,6 +258,7 @@ AsyncBatchDetector::~AsyncBatchDetector()
         if (ctx.d_map)   cudaFree(ctx.d_map);
         if (ctx.h_score) cudaFreeHost(ctx.h_score);
         if (ctx.h_map) cudaFreeHost(ctx.h_map);
+		if (ctx.h_warm) cudaFreeHost(ctx.h_warm);
         if (ctx.evStart)    cudaEventDestroy(ctx.evStart);
         if (ctx.evAfterH2D) cudaEventDestroy(ctx.evAfterH2D);
         if (ctx.evAfterRun) cudaEventDestroy(ctx.evAfterRun);
@@ -328,6 +346,59 @@ void AsyncBatchDetector::preprocessingWorker()
     }
 }
 
+void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input, bool recordMetrics) {
+	Ort::RunOptions ro{ nullptr };
+	const int B = cfg_.batchSize;
+
+    if (ctx.gpu) {
+		cudaEventRecord(ctx.evStart, ctx.stream);
+		cudaMemcpyAsync(ctx.d_input, pinned_input, inputElems_ * sizeof(float), cudaMemcpyHostToDevice, ctx.stream);
+		cudaEventRecord(ctx.evAfterD2H, ctx.stream);
+
+        if(cfg_.loopBatch1) {
+            Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+            for (int i = 0; i < B; ++i) {
+                auto in1 = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_input + (size_t)i * imgElems_, imgElems_, in1Shape_.data(), in1Shape_.size());
+                ctx.binding->BindInput(inputName_.c_str(), in1);
+                auto sc1 = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_score + (size_t)i * scoreElems1_, scoreElems1_, sc1Shape_.data(), sc1Shape_.size());
+                ctx.binding->BindOutput(scoreName_.c_str(), sc1);
+                if (mapIdx_ >= 0) {
+                    auto mp1 = Ort::Value::CreateTensor<float>(cudaMem, ctx.d_map + (size_t)i * mapElems1_, mapElems1_, mp1Shape_.data(), mp1Shape_.size());
+                    ctx.binding->BindOutput(mapName_.c_str(), mp1);
+                }
+                ctx.session->Run(ro, *ctx.binding);
+            }
+        }
+        else {
+            ctx.session->Run(ro, *ctx.binding);
+		}
+
+		cudaEventRecord(ctx.evAfterRun, ctx.stream);
+		cudaMemcpyAsync(ctx.h_score, ctx.d_score, scoreElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
+
+        if (mapIdx_ >= 0) {
+            cudaMemcpyAsync(ctx.h_map, ctx.d_map, mapElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
+			cudaEventRecord(ctx.evAfterD2H, ctx.stream);
+			cudaStreamSynchronize(ctx.stream);
+        }
+		
+        if (recordMetrics) {
+			float h2d = 0, run = 0, d2h = 0;
+			cudaEventElapsedTime(&h2d, ctx.evStart, ctx.evAfterD2H);
+			cudaEventElapsedTime(&run, ctx.evAfterD2H, ctx.evAfterRun);
+			cudaEventElapsedTime(&d2h, ctx.evAfterRun, ctx.evAfterD2H);
+			metrics_.addH2DTime(h2d);
+            metrics_.addRunTime(run);
+            metrics_.addD2HTime(d2h);
+        }
+
+    }
+    else {
+		std::memcpy(ctx.h_input.data(), pinned_input, inputElems_ * sizeof(float));
+		ctx.session->Run(ro, *ctx.binding); // outputs land in h_score / h_map
+    }
+}
+
 void AsyncBatchDetector::inferenceWorker(int session_index)
 {
     SessionCtx& ctx = sessions_[session_index];
@@ -337,61 +408,18 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
     while (is_running_) {
         try {
             std::shared_ptr<BatchData> batch;
-            if (!q_prep_.pop(batch)) break;
-
+			QPop st = q_prep_.pop_for(batch, std::chrono::milliseconds(keepWarmIntervalMs_));
+            if (st == QPop::Stopped) break;
+            if (st == QPop::Timeout) {
+                // keep the GPU warm by running a dummy batch
+                if (ctx.gpu) {
+                    submitBatch(ctx, ctx.h_warm, false);
+                }
+				continue;
+            }
             auto t0 = std::chrono::high_resolution_clock::now();
-            if (ctx.gpu) {
-                // Explicit H2D into VRAM, Run on the bound VRAM tensors, explicit D2H.
-                // All ops enqueued on ctx.stream (the ORT user compute stream), so
-                // H2D -> Run -> D2H are strictly ordered. The pinned input buffer
-                // stays alive until cudaStreamSynchronize below: releasing it right
-                // after enqueuing the async H2D would let a prep thread reacquire
-                // and overwrite it while the copy is still in flight.
-                cudaEventRecord(ctx.evStart, ctx.stream);
-                cudaMemcpyAsync(ctx.d_input, batch->pinned_blob.get(), inputElems_ * sizeof(float), cudaMemcpyHostToDevice, ctx.stream);
-                cudaEventRecord(ctx.evAfterH2D, ctx.stream);
-
-                if (cfg_.loopBatch1) {
-                    Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
-                    for (int i = 0; i < B; ++i) {
-                        auto in1 = Ort::Value::CreateTensor<float>(cudaMem,
-                            ctx.d_input + (size_t)i * imgElems_, imgElems_, in1Shape_.data(), in1Shape_.size());
-                        ctx.binding->BindInput(inputName_.c_str(), in1);
-                        auto sc1 = Ort::Value::CreateTensor<float>(cudaMem,
-                            ctx.d_score + (size_t)i * scoreElems1_, scoreElems1_, sc1Shape_.data(), sc1Shape_.size());
-                        ctx.binding->BindOutput(scoreName_.c_str(), sc1);
-                        if (mapIdx_ >= 0) {
-                            auto mp1 = Ort::Value::CreateTensor<float>(cudaMem,
-                                ctx.d_map + (size_t)i * mapElems1_, mapElems1_, mp1Shape_.data(), mp1Shape_.size());
-                            ctx.binding->BindOutput(mapName_.c_str(), mp1);
-                        }
-                        ctx.session->Run(ro, *ctx.binding);
-                        
-                    }
-                }
-                else {
-                    ctx.session->Run(ro, *ctx.binding);
-                }
-                cudaEventRecord(ctx.evAfterRun, ctx.stream);
-                cudaMemcpyAsync(ctx.h_score, ctx.d_score, scoreElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
-                if (mapIdx_ >= 0)
-                    cudaMemcpyAsync(ctx.h_map, ctx.d_map, mapElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
-                cudaEventRecord(ctx.evAfterD2H, ctx.stream);
-				cudaStreamSynchronize(ctx.stream);
-                batch->pinned_blob.reset(); // H2D completed -> safe to recycle
-                float h2d = 0, run = 0, d2h = 0;
-                cudaEventElapsedTime(&h2d, ctx.evStart, ctx.evAfterH2D);
-                cudaEventElapsedTime(&run, ctx.evAfterH2D, ctx.evAfterRun);
-                cudaEventElapsedTime(&d2h, ctx.evAfterRun, ctx.evAfterD2H);
-                metrics_.addH2DTime(h2d); 
-                metrics_.addRunTime(run); 
-                metrics_.addD2HTime(d2h);
-            }
-            else {
-                std::memcpy(ctx.h_input.data(), batch->pinned_blob.get(), inputElems_ * sizeof(float));
-                batch->pinned_blob.reset(); // done with the staging buffer -> back to the pool
-                ctx.session->Run(ro, *ctx.binding); // outputs land in h_score / h_map
-            }
+			submitBatch(ctx, batch->pinned_blob.get(), true);
+			batch->pinned_blob.reset(); // release the pinned buffer back to the pool
             auto t1 = std::chrono::high_resolution_clock::now();
             metrics_.addGpuTime(std::chrono::duration<double, std::milli>(t1 - t0).count());
 

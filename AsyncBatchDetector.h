@@ -91,6 +91,12 @@ private:
         int map_h = 0, map_w = 0;
     };
 
+    enum class QPop {
+        Ok, 
+        Timeout,
+        Stopped
+    };
+
     // ---- bounded thread-safe queue (verbatim from the original) ----
     template<typename T>
     class BoundedQueue {
@@ -116,6 +122,15 @@ private:
             if (stopped_ && q_.empty()) return false;
             item = std::move(q_.front()); q_.pop(); cv_push_.notify_one(); return true;
         }
+        template<class Rep, class Period>
+        QPop pop_for(T& item, const std::chrono::duration<Rep, Period>& rel_time) {
+            std::unique_lock<std::mutex> l(m_);
+            if (!cv_pop_.wait_for(l, rel_time, [&] { return !q_.empty() || stopped_; }))
+                return QPop::Timeout;
+            if (stopped_ && q_.empty()) return QPop::Stopped;
+            item = std::move(q_.front()); q_.pop(); cv_push_.notify_one(); 
+            return QPop::Ok;
+		}
         void stop() { std::lock_guard<std::mutex> l(m_); stopped_ = true; cv_push_.notify_all(); cv_pop_.notify_all(); }
     };
 
@@ -153,6 +168,7 @@ private:
         std::vector<float> h_input;   // CPU-EP input staging only (no stream, no async)
         float* h_score = nullptr;     // pinned host: D2H landing + CPU-EP output tensor
         float* h_map = nullptr;
+        float* h_warm = nullptr;
         Ort::Value inT{ nullptr }, scoreT{ nullptr }, mapT{ nullptr };
     };
 
@@ -160,9 +176,12 @@ private:
     void inferenceWorker(int session_index);
     void postprocessingWorker();
 
+	void submitBatch(SessionCtx& ctx, const float* pinned_input, bool recordMetrics);
+
     DetectorConfig cfg_;
     ResultCallback sink_;
     PerformanceMetrics& metrics_;
+    const int keepWarmIntervalMs_ = 20;
 
     std::atomic<bool> is_running_{ true };
     std::atomic<int64_t> dropped_frames_{ 0 };
@@ -172,13 +191,13 @@ private:
     // then the pool frees the underlying page-locked memory.
     PinnedPool pinnedPool_;
 
-    BoundedQueue<RawImageTask> q_raw_{ 20 };
+    BoundedQueue<RawImageTask> q_raw_{ 5 };
     BoundedQueue<std::shared_ptr<BatchData>> q_prep_{ 5 };
-    BoundedQueue<std::shared_ptr<InferenceResult>> q_inf_{ 10 };
+    BoundedQueue<std::shared_ptr<InferenceResult>> q_inf_{ 5 };
 
     std::vector<std::thread> pool_prep_, pool_inf_, pool_post_;
-    const int num_prep_threads_ = 2;
-    const int num_post_threads_ = 3;
+    const int num_prep_threads_ = 1;
+    const int num_post_threads_ = 1;
 
     Ort::Env env_{ ORT_LOGGING_LEVEL_WARNING, "AsyncBatchInference" };
     Ort::AllocatorWithDefaultOptions allocator_;
