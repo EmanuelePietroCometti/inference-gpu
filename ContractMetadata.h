@@ -30,6 +30,12 @@ struct ResizeCoeffs {
     std::vector<int> hBounds, vBounds;         // first source index per output pixel
     std::vector<double> hWeights, vWeights;    // [out_size * ksize] normalized weights
 
+    // True when inW==outW && inH==outH. In that case the triangle filter
+    // degenerates to weights [1, 0] on bounds[o]==o for EVERY output pixel, i.e.
+    // the resample is a provably exact identity. ResizeAntialias then skips the
+    // two O(W*H*taps) double-precision passes entirely (bit-identical output).
+    bool identity = false;
+
     // Build coefficients for (inW x inH) -> (outW x outH). Call once per size.
     void Build(int inW, int inH, int outW, int outH);
     bool Matches(int srcW, int srcH) const { return srcW == inW && srcH == inH; }
@@ -38,6 +44,8 @@ struct ResizeCoeffs {
 // Antialiased bilinear resize of a CV_8UC3 image to (coeffs.outW x coeffs.outH).
 // Thread-safe: reads only the shared coeffs and allocates its own intermediate
 // buffer, so concurrent calls with the same coeffs never race.
+// WARNING: on the identity fast path 'dst' is a SHALLOW alias of 'src' (shared
+// pixel buffer, no copy). Callers must treat dst as READ-ONLY.
 void ResizeAntialias(const ResizeCoeffs& coeffs, const cv::Mat& src, cv::Mat& dst);
 
 // Contract parameters read from the ONNX model metadata.

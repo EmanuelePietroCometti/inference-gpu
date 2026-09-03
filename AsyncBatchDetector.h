@@ -181,7 +181,14 @@ private:
     DetectorConfig cfg_;
     ResultCallback sink_;
     PerformanceMetrics& metrics_;
-    const int keepWarmIntervalMs_ = 20;
+    // Queue wait quantum: how long an inference thread blocks on q_prep_ before
+    // re-checking is_running_. Short = responsive shutdown; it is NOT the
+    // keep-warm period.
+    const int kQueueWaitQuantumMs_ = 20;
+    // Continuous idle time before a dummy batch is submitted to hold the GPU
+    // clocks up. Must be well above the frame interval, otherwise the dummy
+    // work contends with real batches. 0 disables keep-warm entirely.
+    const int keepWarmIdleMs_ = 250;
 
     std::atomic<bool> is_running_{ true };
     std::atomic<int64_t> dropped_frames_{ 0 };

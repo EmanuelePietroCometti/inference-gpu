@@ -58,6 +58,7 @@ inline uint8_t RoundClipU8(double v) {
 void ResizeCoeffs::Build(int inW_, int inH_, int outW_, int outH_)
 {
     inW = inW_; inH = inH_; outW = outW_; outH = outH_;
+    identity = (inW == outW && inH == outH);
     PrecomputeCoeffs(inW, outW, hBounds, hWeights, hK);
     PrecomputeCoeffs(inH, outH, vBounds, vWeights, vK);
 }
@@ -66,6 +67,17 @@ void ResizeAntialias(const ResizeCoeffs& c, const cv::Mat& src, cv::Mat& dst)
 {
     const int inH = src.rows, inW = src.cols;
     const int outW = c.outW, outH = c.outH;
+
+    // Identity fast path. With inSize == outSize the triangle filter collapses
+    // to weights [1, 0] anchored on bounds[o] == o for every output pixel, so
+    // the two passes below reduce to a pixel-for-pixel copy. Running them anyway
+    // costs ~1.2M double MACs + ~400k std::floor per 256x256 image, which is the
+    // single largest item in the CPU preprocessing budget. Aliasing instead of
+    // copying keeps this at zero cost; dst is read-only for the caller.
+    if (c.identity && inW == outW && inH == outH) {
+        dst = src;
+        return;
+    }
 
     // Horizontal pass: [inH x inW] -> [inH x outW]. Scratch is LOCAL, so this
     // function is safe to call concurrently from the batch parallel_for.

@@ -318,19 +318,49 @@ void AsyncBatchDetector::preprocessingWorker()
 
             // prep: contract preprocessing straight into the pinned NCHW buffer
             auto t_p0 = std::chrono::high_resolution_clock::now();
+            // Per-channel affine in MODEL channel order (RGB when swapRB): the
+            // old code did cvtColor(BGR2RGB) then split, so plane c already
+            // carried the RGB-ordered channel that mean[c]/stddev[c] expects.
+            float chScale[3], chOffset[3];
+            for (int c = 0; c < modelC_ && c < 3; ++c) {
+                chScale[c]  = normInGraph ? (1.0f / 255.0f) : (1.0f / (255.0f * stddev[c]));
+                chOffset[c] = normInGraph ? 0.0f            : (mean[c] / stddev[c]);
+            }
+
             cv::parallel_for_(cv::Range(0, B), [&](const cv::Range& r) {
                 cv::Mat resized;
-                std::vector<cv::Mat> planes(modelC_);
                 for (int i = r.start; i < r.end; ++i) {
+                    // READ-ONLY: on the identity fast path 'resized' aliases
+                    // task.patches[i], which is also batch->original_patches[i]
+                    // and is still needed by the overlay stage. The previous
+                    // in-place cvtColor here would corrupt it.
                     ResizeAntialias(resizeCoeffs_, task.patches[i], resized);
-                    if (swapRB && modelC_ == 3) cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
-                    cv::split(resized, planes);
-                    for (int c = 0; c < modelC_; ++c) {
-                        const float scale = normInGraph ? (1.0f / 255.0f) : (1.0f / (255.0f * stddev[c]));
-                        const float offset = normInGraph ? 0.0f : (mean[c] / stddev[c]);
-                        float* dst = pinned + (size_t)i * modelC_ * planeSize + (size_t)c * planeSize;
-                        cv::Mat planeF32(modelH_, modelW_, CV_32FC1, dst);
-                        planes[c].convertTo(planeF32, CV_32FC1, scale, -offset);
+
+                    float* dst0 = pinned + (size_t)i * modelC_ * planeSize;
+
+                    if (modelC_ == 3) {
+                        // Single fused pass: interleaved BGR u8 -> planar f32 CHW,
+                        // channel swap + scale/offset applied inline. Replaces
+                        // cvtColor + split + 3x convertTo (5 full passes over the
+                        // image, 3 temporary Mats) with one pass and no allocation.
+                        float* p0 = dst0;
+                        float* p1 = dst0 + planeSize;
+                        float* p2 = dst0 + 2 * planeSize;
+                        const int b0 = swapRB ? 2 : 0;   // source byte feeding plane 0
+                        const int b2 = swapRB ? 0 : 2;   // source byte feeding plane 2
+                        for (int y = 0; y < modelH_; ++y) {
+                            const uint8_t* srow = resized.ptr<uint8_t>(y);
+                            const size_t o = (size_t)y * modelW_;
+                            for (int x = 0; x < modelW_; ++x, srow += 3) {
+                                p0[o + x] = srow[b0] * chScale[0] - chOffset[0];
+                                p1[o + x] = srow[1]  * chScale[1] - chOffset[1];
+                                p2[o + x] = srow[b2] * chScale[2] - chOffset[2];
+                            }
+                        }
+                    }
+                    else {
+                        cv::Mat planeF32(modelH_, modelW_, CV_32FC1, dst0);
+                        resized.convertTo(planeF32, CV_32FC1, chScale[0], -chOffset[0]);
                     }
                 }
             });
@@ -351,9 +381,13 @@ void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input,
 	const int B = cfg_.batchSize;
 
     if (ctx.gpu) {
+		// NOTE: this event MUST be evAfterH2D. Recording evAfterD2H here made the
+		// same event be recorded twice per submit (here and after the D2H below):
+		// the second record overwrote the first, so elapsed(evAfterD2H, evAfterRun)
+		// measured backwards in time and Run came out NEGATIVE.
 		cudaEventRecord(ctx.evStart, ctx.stream);
 		cudaMemcpyAsync(ctx.d_input, pinned_input, inputElems_ * sizeof(float), cudaMemcpyHostToDevice, ctx.stream);
-		cudaEventRecord(ctx.evAfterD2H, ctx.stream);
+		cudaEventRecord(ctx.evAfterH2D, ctx.stream);
 
         if(cfg_.loopBatch1) {
             Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
@@ -375,17 +409,19 @@ void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input,
 
 		cudaEventRecord(ctx.evAfterRun, ctx.stream);
 		cudaMemcpyAsync(ctx.h_score, ctx.d_score, scoreElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
-
-        if (mapIdx_ >= 0) {
+        if (mapIdx_ >= 0)
             cudaMemcpyAsync(ctx.h_map, ctx.d_map, mapElems_ * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream);
-			cudaEventRecord(ctx.evAfterD2H, ctx.stream);
-			cudaStreamSynchronize(ctx.stream);
-        }
-		
+		cudaEventRecord(ctx.evAfterD2H, ctx.stream);
+
+		// UNCONDITIONAL: the caller reads ctx.h_score / ctx.h_map right after this
+		// returns. Syncing only when a map output exists left the score D2H in
+		// flight on map-less models -> the host read stale/garbage scores.
+		cudaStreamSynchronize(ctx.stream);
+
         if (recordMetrics) {
 			float h2d = 0, run = 0, d2h = 0;
-			cudaEventElapsedTime(&h2d, ctx.evStart, ctx.evAfterD2H);
-			cudaEventElapsedTime(&run, ctx.evAfterD2H, ctx.evAfterRun);
+			cudaEventElapsedTime(&h2d, ctx.evStart,    ctx.evAfterH2D);
+			cudaEventElapsedTime(&run, ctx.evAfterH2D, ctx.evAfterRun);
 			cudaEventElapsedTime(&d2h, ctx.evAfterRun, ctx.evAfterD2H);
 			metrics_.addH2DTime(h2d);
             metrics_.addRunTime(run);
@@ -405,18 +441,30 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
     const int B = cfg_.batchSize;
     Ort::RunOptions ro{ nullptr };
 
+    // Idle accounting for the keep-warm heuristic. The wait quantum is kept
+    // short so shutdown stays responsive, but a dummy batch is only injected
+    // after keepWarmIdleMs_ of CONTINUOUS idleness. Firing one every 20 ms (the
+    // wait quantum) put a full 17-image H2D + Run + D2H + stream sync on the
+    // GPU several times per second, in direct contention with the real batches.
+    auto lastRealWork = std::chrono::steady_clock::now();
+
     while (is_running_) {
         try {
             std::shared_ptr<BatchData> batch;
-			QPop st = q_prep_.pop_for(batch, std::chrono::milliseconds(keepWarmIntervalMs_));
+			QPop st = q_prep_.pop_for(batch, std::chrono::milliseconds(kQueueWaitQuantumMs_));
             if (st == QPop::Stopped) break;
             if (st == QPop::Timeout) {
-                // keep the GPU warm by running a dummy batch
-                if (ctx.gpu) {
-                    submitBatch(ctx, ctx.h_warm, false);
+                if (ctx.gpu && keepWarmIdleMs_ > 0) {
+                    const auto idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - lastRealWork).count();
+                    if (idleMs >= keepWarmIdleMs_) {
+                        submitBatch(ctx, ctx.h_warm, false);
+                        lastRealWork = std::chrono::steady_clock::now(); // re-arm
+                    }
                 }
 				continue;
             }
+            lastRealWork = std::chrono::steady_clock::now();
             auto t0 = std::chrono::high_resolution_clock::now();
 			submitBatch(ctx, batch->pinned_blob.get(), true);
 			batch->pinned_blob.reset(); // release the pinned buffer back to the pool
