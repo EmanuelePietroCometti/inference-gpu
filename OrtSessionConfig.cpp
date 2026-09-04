@@ -194,7 +194,7 @@ bool ConfigureOrtSessionOptions(Ort::Env& env, Ort::SessionOptions& so, Detector
             "device_id", "enable_cuda_graph", "nv_runtime_cache_path", "nv_detailed_build_log"
         };
         std::vector<std::string> ovals = {
-            "0", "0" /* loopBatch1 rebinds at every Run -> CUDA graph OFF */, nvCache, "0"
+            "0", "1" /* loopBatch1 rebinds at every Run -> CUDA graph OFF */, nvCache, "0"
         };
         if (userComputeStream) {
             char b[32];

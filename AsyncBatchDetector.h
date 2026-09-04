@@ -150,6 +150,28 @@ private:
         void release(float* p);
         void stop();
         ~PinnedPool();
+
+    };
+
+
+    // Fixed pool of plain (non-pinned) host output buffers for the overlay
+    // image, allocated ONCE. Mirrors PinnedPool's design for the input side: the
+    // post stage was allocating and freeing a fresh ~B*imgBytes buffer (12+ MB
+    // for a 512x512x3, batch-17 config) via make_unique EVERY batch -- pure
+    // allocator + first-touch-page-fault churn, and the most plausible cause of
+    // the largest observed latency outliers (177 ms max vs 81 ms avg).
+    class OverlayPool {
+        std::vector<unsigned char*> all_;
+        std::vector<unsigned char*> free_;
+        std::mutex m_;
+        std::condition_variable cv_;
+        bool stopped_ = false;
+    public:
+        void init(size_t count, size_t bytesPerBuffer);
+        unsigned char* acquire();   // blocks until a buffer frees; nullptr if stopped
+        void release(unsigned char* p);
+        void stop();
+        ~OverlayPool();
     };
 
     // Per-session ONNX + IoBinding context (one per inference thread)
@@ -176,7 +198,7 @@ private:
     void inferenceWorker(int session_index);
     void postprocessingWorker();
 
-	void submitBatch(SessionCtx& ctx, const float* pinned_input, bool recordMetrics);
+    void submitBatch(SessionCtx& ctx, const float* pinned_input, bool recordMetrics, std::shared_ptr<float> pinnedBlob = nullptr);
 
     DetectorConfig cfg_;
     ResultCallback sink_;
@@ -197,6 +219,7 @@ private:
     // releases any held BatchData (returning its pinned buffer to this pool),
     // then the pool frees the underlying page-locked memory.
     PinnedPool pinnedPool_;
+    OverlayPool overlayPool_;
 
     BoundedQueue<RawImageTask> q_raw_{ 20 };
     BoundedQueue<std::shared_ptr<BatchData>> q_prep_{ 10 };

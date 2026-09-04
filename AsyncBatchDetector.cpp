@@ -11,6 +11,25 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+    // Heap-allocated context for the CUDA stream host-callback below. Holding a
+    // COPY of the shared_ptr here (and only here) means the pinned input buffer
+    // is released back to the pool at the EARLIEST safe moment -- right after the
+    // H2D copy that reads it finishes on the GPU -- instead of waiting for the
+    // whole batch (H2D + all Run() calls + D2H + stream sync) to complete.
+    struct PinnedReleaseCtx {
+        std::shared_ptr<float> blob;
+    };
+
+    // CUDA stream host callback: fires on a CUDA driver internal thread once
+    // every operation enqueued on the stream BEFORE this callback (here: only
+    // the H2D copy) has completed. Must be fast and must NOT call back into the
+    // CUDA API -- releasing to a plain mutex-protected pool is safe.
+    void CUDART_CB ReleasePinnedInputCallback(void* userData) {
+        std::unique_ptr<PinnedReleaseCtx> ctx(static_cast<PinnedReleaseCtx*>(userData));
+        // ctx's destructor drops the shared_ptr -> PinnedPool::release() runs here.
+    }
+}
 // ---------------------------------------------------------------------------
 // PinnedPool: page-locked host buffers allocated once and recycled.
 // ---------------------------------------------------------------------------
@@ -56,6 +75,31 @@ AsyncBatchDetector::PinnedPool::~PinnedPool()
 {
     for (float* p : all_) if (p) cudaFreeHost(p);
 }
+
+// AsyncBatchDetector.cpp — implementation, next to PinnedPool's:
+
+void AsyncBatchDetector::OverlayPool::init(size_t count, size_t bytesPerBuffer) {
+    all_.reserve(count); free_.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto* p = new unsigned char[bytesPerBuffer];
+        all_.push_back(p); free_.push_back(p);
+    }
+}
+unsigned char* AsyncBatchDetector::OverlayPool::acquire() {
+    std::unique_lock<std::mutex> l(m_);
+    cv_.wait(l, [&] { return !free_.empty() || stopped_; });
+    if (stopped_) return nullptr;
+    unsigned char* p = free_.back(); free_.pop_back(); return p;
+}
+void AsyncBatchDetector::OverlayPool::release(unsigned char* p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> l(m_);
+    free_.push_back(p); cv_.notify_one();
+}
+void AsyncBatchDetector::OverlayPool::stop() {
+    std::lock_guard<std::mutex> l(m_); stopped_ = true; cv_.notify_all();
+}
+AsyncBatchDetector::OverlayPool::~OverlayPool() { for (auto* p : all_) delete[] p; }
 
 AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback sink, PerformanceMetrics& metrics)
     : cfg_(cfg), sink_(std::move(sink)), metrics_(metrics)
@@ -148,6 +192,13 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
     pinnedPool_.init(pinnedCount, inputElems_);
     Log::Info("Pinned pool: {} buffers x {} f32 ({:.1f} MB total).",
         pinnedCount, inputElems_, pinnedCount * inputElems_ * sizeof(float) / (1024.0 * 1024.0));
+
+    const size_t imgBytesForOverlay = (size_t)cfg_.imgW * cfg_.imgH * cfg_.channels;
+    const size_t overlayCount = (size_t)num_post_threads_ + 2; // one per post worker + margin
+    overlayPool_.init(overlayCount, (size_t)cfg_.batchSize * imgBytesForOverlay);
+    Log::Info("Overlay pool: {} buffers x {} bytes ({:.1f} MB total).",
+        overlayCount, cfg_.batchSize * imgBytesForOverlay,
+        overlayCount * cfg_.batchSize * imgBytesForOverlay / (1024.0 * 1024.0));
 
     // ---- per-session IoBinding setup ----
     for (int i = 0; i < cfg_.numInfThreads; ++i) {
@@ -246,6 +297,7 @@ AsyncBatchDetector::~AsyncBatchDetector()
     is_running_ = false;
     q_raw_.stop(); q_prep_.stop(); q_inf_.stop();
     pinnedPool_.stop();   // unblock any prep thread waiting on acquire()
+    overlayPool_.stop();
     for (auto& t : pool_prep_) if (t.joinable()) t.join();
     for (auto& t : pool_inf_)  if (t.joinable()) t.join();
     for (auto& t : pool_post_) if (t.joinable()) t.join();
@@ -388,7 +440,7 @@ void AsyncBatchDetector::preprocessingWorker()
     }
 }
 
-void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input, bool recordMetrics) {
+void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input, bool recordMetrics, std::shared_ptr<float> pinnedBlob) {
 	Ort::RunOptions ro{ nullptr };
 	const int B = cfg_.batchSize;
 
@@ -400,6 +452,16 @@ void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input,
 		cudaEventRecord(ctx.evStart, ctx.stream);
 		cudaMemcpyAsync(ctx.d_input, pinned_input, inputElems_ * sizeof(float), cudaMemcpyHostToDevice, ctx.stream);
 		cudaEventRecord(ctx.evAfterH2D, ctx.stream);
+
+        // ZERO-COPY FIX: return the host staging buffer to the pool as soon as the
+        // H2D copy is done on the GPU, not after Run()+D2H()+stream-sync. Using
+        // cudaLaunchHostFunc (not a blocking cudaEventSynchronize) means this costs
+        // the calling inference-worker thread ZERO wait time: the release happens on
+        // a CUDA driver callback thread, fully out of the critical path.
+        if (pinnedBlob) {
+            auto* releaseCtx = new PinnedReleaseCtx{ std::move(pinnedBlob) };
+            cudaLaunchHostFunc(ctx.stream, ReleasePinnedInputCallback, releaseCtx);
+        }
 
         if(cfg_.loopBatch1) {
             Ort::MemoryInfo cudaMem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
@@ -428,7 +490,7 @@ void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input,
 		// UNCONDITIONAL: the caller reads ctx.h_score / ctx.h_map right after this
 		// returns. Syncing only when a map output exists left the score D2H in
 		// flight on map-less models -> the host read stale/garbage scores.
-		cudaStreamSynchronize(ctx.stream);
+		// cudaStreamSynchronize(ctx.stream);
 
         if (recordMetrics) {
 			float h2d = 0, run = 0, d2h = 0;
@@ -478,8 +540,8 @@ void AsyncBatchDetector::inferenceWorker(int session_index)
             }
             lastRealWork = std::chrono::steady_clock::now();
             auto t0 = std::chrono::high_resolution_clock::now();
-			submitBatch(ctx, batch->pinned_blob.get(), true);
-			batch->pinned_blob.reset(); // release the pinned buffer back to the pool
+            submitBatch(ctx, batch->pinned_blob.get(), true, batch->pinned_blob);
+            batch->pinned_blob.reset();
             auto t1 = std::chrono::high_resolution_clock::now();
             metrics_.addGpuTime(std::chrono::duration<double, std::milli>(t1 - t0).count());
 
@@ -516,12 +578,16 @@ void AsyncBatchDetector::postprocessingWorker()
             if (res->scores.empty()) throw std::runtime_error("empty score output");
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            auto out = std::make_unique<unsigned char[]>((size_t)B * imgBytes);
+            // Borrow a buffer from the pool instead of a fresh
+            // ~12+ MB heap allocation every batch (see OverlayPool's comment).
+            unsigned char* rawOut = overlayPool_.acquire();
+            if (!rawOut) break; // pool stopped (shutdown)
+            std::shared_ptr<unsigned char[]> out(rawOut, [this](unsigned char* p) { overlayPool_.release(p); });
             std::vector<uint8_t> statuses(B, 0);
             const bool haveMap = (mapIdx_ >= 0) && !res->maps.empty();
 
             cv::parallel_for_(cv::Range(0, B), [&](const cv::Range& r) {
-                cv::Mat u8heat, largeHeat, colorHeat, overlay, maskFull;
+                cv::Mat u8heat, largeHeat, colorHeat, maskFull, maskModel;
                 std::vector<std::vector<cv::Point>> contours;
                 for (int j = r.start; j < r.end; ++j) {
                     const cv::Mat& orig = res->batch_info->original_patches[j];
@@ -533,19 +599,19 @@ void AsyncBatchDetector::postprocessingWorker()
 
                     if (haveMap) {
                         cv::Mat map(res->map_h, res->map_w, CV_32F, res->maps.data() + (size_t)j * res->map_h * res->map_w);
+
                         map.convertTo(u8heat, CV_8UC1, alpha, beta);
                         cv::resize(u8heat, largeHeat, cv::Size(cfg_.imgW, cfg_.imgH), 0, 0, cv::INTER_LINEAR);
                         cv::applyColorMap(largeHeat, colorHeat, cv::COLORMAP_JET);
-                        cv::addWeighted(orig, 1.0 - m_blendAlpha_, colorHeat, m_blendAlpha_, 0.0, overlay);
 
+                        cv::addWeighted(orig, 1.0 - m_blendAlpha_, colorHeat, m_blendAlpha_, 0.0, dest);
                         if (contract_.hasPixelThreshold) {
-                            cv::Mat maskModel = map >= contract_.pixelThreshold;
+                            cv::compare(map, contract_.pixelThreshold, maskModel, cv::CMP_GE);
                             cv::resize(maskModel, maskFull, cv::Size(cfg_.imgW, cfg_.imgH), 0, 0, cv::INTER_NEAREST);
                             contours.clear();
                             cv::findContours(maskFull, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-                            cv::drawContours(overlay, contours, -1, cv::Scalar(255, 0, 0), 2);
+                            cv::drawContours(dest, contours, -1, cv::Scalar(255, 0, 0), 2);
                         }
-                        overlay.copyTo(dest);
                     }
                     else {
                         orig.copyTo(dest); // no map output: publish the original frame
