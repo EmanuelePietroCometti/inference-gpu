@@ -61,7 +61,7 @@ AsyncBatchDetector::AsyncBatchDetector(const DetectorConfig& cfg, ResultCallback
     : cfg_(cfg), sink_(std::move(sink)), metrics_(metrics)
 {
     metrics_.batch_size = cfg_.batchSize;
-    cv::setNumThreads((std::max)(1, cv::getNumberOfCPUs()));
+    cv::setNumThreads((std::max)(1, cv::getNumberOfCPUs()/2));
     cudaSetDevice(0);
 
 #ifdef TENSORRT_RTX
@@ -277,8 +277,20 @@ bool AsyncBatchDetector::pushBatch(const unsigned char* slot, int frame_id, int 
     task.seq = seq;
     task.patches.reserve(cfg_.batchSize);
     for (int i = 0; i < cfg_.batchSize; ++i) {
-        cv::Mat img(cfg_.imgH, cfg_.imgW, type, const_cast<unsigned char*>(slot + i * imgBytes));
-        task.patches.push_back(img.clone()); // detach from the MMF slot
+        // ZERO-COPY: header-only view over the MMF ring slot, no pixel copy.
+        //
+        // Lifetime contract (IPC_Shared.h): the producer owns ringSlots permits
+        // and releases the one for slot (seq % ringSlots) only when the matching
+        // result block flips to RESULT_READY. PublishResult sets that flag AFTER
+        // the post stage is done reading original_patches, so the slot cannot be
+        // overwritten while any stage still points into it.
+        //
+        // Every downstream stage is READ-ONLY on these Mats:
+        //   - ResizeAntialias() only reads 'src' (and on the identity fast path
+        //     aliases it into 'dst', which the fused NCHW loop also only reads)
+        //   - postprocessingWorker() only does addWeighted(orig, ...) / orig.copyTo()
+        // Any in-place op introduced on patches[] here would corrupt the ring.
+        task.patches.emplace_back(cfg_.imgH, cfg_.imgW, type, const_cast<unsigned char*>(slot + (size_t)i * imgBytes));
     }
     if (!q_raw_.try_push(std::move(task))) {
         dropped_frames_++;

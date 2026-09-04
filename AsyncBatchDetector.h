@@ -198,13 +198,13 @@ private:
     // then the pool frees the underlying page-locked memory.
     PinnedPool pinnedPool_;
 
-    BoundedQueue<RawImageTask> q_raw_{ 5 };
-    BoundedQueue<std::shared_ptr<BatchData>> q_prep_{ 5 };
+    BoundedQueue<RawImageTask> q_raw_{ 20 };
+    BoundedQueue<std::shared_ptr<BatchData>> q_prep_{ 10 };
     BoundedQueue<std::shared_ptr<InferenceResult>> q_inf_{ 5 };
 
     std::vector<std::thread> pool_prep_, pool_inf_, pool_post_;
-    const int num_prep_threads_ = 1;
-    const int num_post_threads_ = 1;
+    const int num_prep_threads_ = 5;
+    const int num_post_threads_ = 5;
 
     Ort::Env env_{ ORT_LOGGING_LEVEL_WARNING, "AsyncBatchInference" };
     Ort::AllocatorWithDefaultOptions allocator_;
