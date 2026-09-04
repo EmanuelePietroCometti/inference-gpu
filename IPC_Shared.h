@@ -194,14 +194,12 @@ inline SIZE_T IpcImageBytes(const controlPoint& cp) {
 
 // Total bytes of the input MMF: header + ring of (ringSlots) batches
 inline SIZE_T IpcInputMmfBytes(const controlPoint& cp) {
-    return sizeof(batchInputHeader)
-        + static_cast<SIZE_T>(IpcRingSlots(cp)) * cp.batchSize * IpcImageBytes(cp);
+    return sizeof(batchInputHeader) + static_cast<SIZE_T>(IpcRingSlots(cp)) * cp.batchSize * IpcImageBytes(cp);
 }
 
 // Byte offset of ring slot 'slot' inside the input MMF
 inline SIZE_T IpcInputSlotOffset(const controlPoint& cp, DWORD slot) {
-    return sizeof(batchInputHeader)
-        + static_cast<SIZE_T>(slot) * cp.batchSize * IpcImageBytes(cp);
+    return sizeof(batchInputHeader) + static_cast<SIZE_T>(slot) * cp.batchSize * IpcImageBytes(cp);
 }
 
 // Bytes of ONE overlay batch (kBatchSize overlays)

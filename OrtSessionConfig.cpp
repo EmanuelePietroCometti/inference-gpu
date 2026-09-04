@@ -134,6 +134,7 @@ bool ConfigureOrtSessionOptions(Ort::Env& env, Ort::SessionOptions& so, Detector
             "trt_engine_cache_path",
             "trt_timing_cache_enable",
             "trt_timing_cache_path",
+            "trt_builder_optimization_level",
         };
 
         std::vector<const char*> option_values = {
@@ -147,6 +148,7 @@ bool ConfigureOrtSessionOptions(Ort::Env& env, Ort::SessionOptions& so, Detector
             engineCache.c_str(),    // trt_engine_cache_path
             "1",                    // trt_timing_cache_enable
             timingCache.c_str(),    // trt_timing_cache_path
+			"5",                    // trt_builder_optimization_level
         };
 
         // Apply standard key-value string options
