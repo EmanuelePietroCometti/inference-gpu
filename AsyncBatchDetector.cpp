@@ -490,7 +490,7 @@ void AsyncBatchDetector::submitBatch(SessionCtx& ctx, const float* pinned_input,
 		// UNCONDITIONAL: the caller reads ctx.h_score / ctx.h_map right after this
 		// returns. Syncing only when a map output exists left the score D2H in
 		// flight on map-less models -> the host read stale/garbage scores.
-		// cudaStreamSynchronize(ctx.stream);
+		cudaStreamSynchronize(ctx.stream);
 
         if (recordMetrics) {
 			float h2d = 0, run = 0, d2h = 0;

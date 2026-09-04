@@ -39,7 +39,12 @@ struct BatchOutput {
     int map_h = 0, map_w = 0;
     std::vector<float>   scores;        // kBatchSize raw anomaly scores
     std::vector<uint8_t> statuses;      // 0 = OK, 1 = REJECT
-    std::unique_ptr<unsigned char[]> overlay; // batch * overlayBytesPerImage
+    // Pooled buffer (see OverlayPool) with a custom deleter that returns it to
+    // the pool instead of freeing it. Must be shared_ptr, not unique_ptr: the
+    // custom per-instance deleter (a lambda capturing 'this') is only expressible
+    // via shared_ptr's type-erased deleter without also templating BatchOutput
+    // on a deleter type.
+    std::shared_ptr<unsigned char[]> overlay;
     size_t overlayBytesPerImage = 0;
 };
 
